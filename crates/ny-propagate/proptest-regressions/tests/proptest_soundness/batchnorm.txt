@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 665fec37ead95c833f59b458d8f6af3f6632ec88e59e6c5731d06845472fd708 # shrinks to (l0, u0) = (0.0, 0.0), (l1, u1) = (-4.163733, 0.0), (l2, u2) = (0.0, 0.0), mean0 = 0.0, mean1 = -1.343156, mean2 = 0.0, var0 = 0.1, var1 = 0.120396465, var2 = 0.1, gamma0 = 0.5, gamma1 = 1.9455975, gamma2 = 0.5, beta0 = 0.0, beta1 = 0.5272953, beta2 = 0.0
+cc 37e638522fe1c24fbd912114319b16d6de88e88a986a7c08875253554a3abbe8 # shrinks to (l0, u0) = (0.0, 0.0), (l1, u1) = (-4.858035, -2.1175158), (l2, u2) = (0.0, 0.0), mean0 = 0.0, mean1 = -0.30350307, mean2 = 0.0, var0 = 0.1, var1 = 0.2618936, var2 = 0.1, gamma0 = 0.5, gamma1 = 1.8704042, gamma2 = 0.5, beta0 = 0.0, beta1 = 0.8659897, beta2 = 0.0

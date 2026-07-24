@@ -1,0 +1,58 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-deny configuration for ny — a proof-carrying NN-verification runtime.
+# Primary purpose: a RUSTSEC advisory gate over security advisories and
+# unmaintained crates. The gate is manual — there is no CI runner in this repo,
+# so nothing fails a build on it. Run `make deny` on every dependency bump and
+# before publishing, and clear or `ignore` what it reports.
+
+[advisories]
+version = 2
+# Yanked crate versions in the lockfile are an error.
+yanked = "deny"
+# Consciously-accepted advisories. Each MUST carry a reason + tracking pointer.
+# Re-audit on every dependency bump. (The pyo3 OOB-read advisories
+# RUSTSEC-2026-0176/0177 were cleared by the pyo3 0.29 bump and removed here.)
+ignore = [
+    # paste is unmaintained (not a vulnerability), pulled transitively via
+    # gemm 0.19 (a build-time proc-macro), which both faer 0.24 and candle 0.10
+    # depend on. No maintained replacement is wired through gemm yet; the crate
+    # is proc-macro-only (no runtime surface). Re-check when gemm drops paste.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro-only; transitive via gemm 0.19 (faer 0.24 + candle 0.10)" },
+]
+
+[bans]
+# ny vendors num-bigint/num-rational/num-traits for exact-rational certificates
+# that must stay byte-compatible with Clean's verifier — surface dup versions.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # Permissive (BSD-family) license of libbz2-rs-sys, pulled transitively by
+    # zip 7.x under the optional `pytorch` feature (candle-core). Not in the
+    # default tree. OSI-permissive-equivalent.
+    "bzip2-1.0.6",
+    # Community Data License Agreement – Permissive 2.0, on esaxx-rs (via
+    # tokenizers <- candle-core, optional `pytorch` feature only). A permissive
+    # no-copyleft license; not in the default tree.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

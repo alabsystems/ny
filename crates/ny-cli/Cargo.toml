@@ -1,0 +1,72 @@
+[package]
+name = "ny-cli"
+description = "Command-line interface for ny verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ny"
+path = "src/main.rs"
+
+[features]
+default = ["pytorch", "coreml", "gguf"]
+pytorch = ["ny-onnx/pytorch"]
+coreml = ["ny-onnx/coreml"]
+gguf = ["ny-onnx/gguf"]
+mip = ["ny-mip", "dep:num-rational", "dep:num-traits"]
+# Native CUDA / cuBLAS acceleration for the sound f64 CROWN backward (NVIDIA
+# datacenter GPUs, e.g. GB10). When built with this feature and a CUDA device is
+# present, the sound f64 A·W GEMMs run on cuBLAS Dgemm — a SOUND, ~18–34x faster
+# verdict path (works even under the sound_gpu_gate). Opt-in: needs CUDA + driver.
+cuda = ["dep:ny-cuda"]
+# Enable tests that require external models (whisper, kokoro, gemma)
+external-models = []
+
+[dependencies]
+mimalloc = "0.1"
+rayon.workspace = true
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+ny-propagate = { path = "../ny-propagate" }
+ny-onnx = { path = "../ny-onnx" }
+ny-trace-bridge = { path = "../ny-trace-bridge" }
+ny-gpu = { path = "../ny-gpu" }
+ny-cuda = { path = "../ny-cuda", optional = true }
+ny-cert = { path = "../ny-cert" }
+ny-api = { path = "../ny-api", features = ["cert"] }
+ny-groundtruth = { path = "../ny-groundtruth" }
+ny-mip = { path = "../ny-mip", optional = true }
+# Exact rational arithmetic for the graph-MIP pinned-column fold (inc5c) —
+# the same exact seam ny-mip already uses (`num_rational::BigRational`).
+num-rational = { workspace = true, optional = true }
+num-traits = { workspace = true, optional = true }
+ndarray.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils" }
+rand.workspace = true
+flate2 = "1.0"
+prost.workspace = true
+ntest.workspace = true

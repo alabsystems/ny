@@ -1,0 +1,179 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Staged recipe-transfer experiments from
+# docs/ALPHA_BETA_CROWN_PERFORMANCE_TRANSFER_PLAN_2026-07-22.md.
+#
+# Each arm changes exactly the listed field(s). No arm is a production preset;
+# promotion requires the plan's solved-count/fixed-wall gates.
+
+schema_version: 1
+corpus_manifest: benchmarks/abcrown_transfer_corpus_v1.json
+
+experiments:
+  - name: cgan_recipe
+    year: 2025
+    category: cgan_2023
+    base_preset: configs/vnncomp25/cgan_2023.yaml
+    # Occurrence 7 is the generator-enclosure target; occurrence 1 is the
+    # already-solved regression sentinel. IDs resolve through the sealed corpus.
+    corpus_ids: [cgan-occurrence-7, cgan-occurrence-1-sentinel]
+    arms:
+      - name: baseline
+        overrides: {}
+      - name: skip_final_alpha_gradient
+        overrides: {}
+        env:
+          NY_ALPHA_FINAL_BOUND_ONLY: "1"
+        disposition: default_off_execution_treatment
+      - name: device_wgpu
+        overrides:
+          general.device: wgpu
+      - name: matrix_conv
+        overrides:
+          general.conv_mode: matrix
+      - name: plain_crown
+        overrides:
+          solver.bound_prop_method: crown
+      - name: pgd_100
+        overrides:
+          attack.pgd_restarts: 100
+      - name: sb_threshold_1e_2
+        overrides:
+          bab.branching.input_split.sb_coeff_thresh: 0.01
+      - name: reorder_bab
+        overrides:
+          bab.branching.input_split.reorder_bab: true
+      - name: batch_1_auto_enlarge
+        overrides:
+          bab.batch_size: 1
+          bab.auto_enlarge_batch_size: true
+      - name: adaptive_microbatch_controller
+        overrides:
+          bab.batch_size: 1
+          bab.auto_enlarge_batch_size: true
+        env:
+          NY_ADAPTIVE_MICROBATCH_CONTROLLER: "1"
+        disposition: default_off_execution_treatment
+      - name: crown_build_batch_512
+        overrides:
+          solver.build_batch_size: 512
+      - name: supported_upstream_bundle
+        overrides:
+          general.device: wgpu
+          general.conv_mode: matrix
+          solver.bound_prop_method: crown
+          solver.build_batch_size: 512
+          attack.pgd_restarts: 100
+          bab.batch_size: 1
+          bab.auto_enlarge_batch_size: true
+          bab.branching.input_split.sb_coeff_thresh: 0.01
+          bab.branching.input_split.reorder_bab: true
+
+  - name: cifar100_recipe
+    year: 2025
+    category: cifar100_2024
+    base_preset: configs/vnncomp25/cifar100_2024.yaml
+    corpus_ids: [cifar100-medium-1761, cifar100-medium-2477]
+    arms:
+      - name: baseline
+        overrides: {}
+      - name: skip_final_alpha_gradient
+        overrides: {}
+        env:
+          NY_ALPHA_FINAL_BOUND_ONLY: "1"
+        disposition: default_off_execution_treatment
+      - name: packed_graph_alpha_queue
+        overrides: {}
+        env:
+          NY_PACKED_GRAPH_ALPHA_QUEUE: "1"
+        disposition: default_off_execution_treatment
+      - name: auto_enlarge
+        overrides:
+          bab.auto_enlarge_batch_size: true
+      - name: adaptive_microbatch_controller
+        overrides:
+          bab.auto_enlarge_batch_size: true
+        env:
+          NY_ADAPTIVE_MICROBATCH_CONTROLLER: "1"
+        disposition: default_off_execution_treatment
+      - name: clip_intermediate
+        overrides:
+          bab.clip.interm_domain: true
+          bab.clip.in_alpha_crown: true
+      - name: direct_no_interm_transfer
+        overrides:
+          bab.interm_transfer: false
+      - name: root_dense_head_off
+        overrides:
+          bab.root_crown_interm_dense_head: false
+        disposition: ny_control_not_upstream_parity
+      - name: root_sparse_explicit
+        overrides: {}
+        env:
+          NY_ROOT_SPARSE_INTERM_CROWN: "1"
+        disposition: ny_control_not_upstream_parity
+
+  - name: tinyimagenet_recipe
+    year: 2025
+    category: tinyimagenet_2024
+    base_preset: configs/vnncomp25/tinyimagenet_2024.yaml
+    corpus_ids: [tinyimagenet-medium-1126, tinyimagenet-medium-7943]
+    arms:
+      - name: baseline
+        overrides: {}
+      - name: skip_final_alpha_gradient
+        overrides: {}
+        env:
+          NY_ALPHA_FINAL_BOUND_ONLY: "1"
+        disposition: default_off_execution_treatment
+      - name: packed_graph_alpha_queue
+        overrides: {}
+        env:
+          NY_PACKED_GRAPH_ALPHA_QUEUE: "1"
+        disposition: default_off_execution_treatment
+      - name: batch_256
+        overrides:
+          bab.batch_size: 256
+      - name: kfsb_candidates_7
+        overrides:
+          bab.branching.candidates: 7
+      - name: beta_iterations_8
+        overrides:
+          bab.beta_crown.iterations: 8
+      - name: clip_intermediate
+        overrides:
+          bab.clip.interm_domain: true
+          bab.clip.in_alpha_crown: true
+      - name: direct_no_interm_transfer
+        overrides:
+          bab.interm_transfer: false
+      - name: upstream_v25_bundle
+        overrides:
+          bab.batch_size: 256
+          bab.branching.candidates: 7
+          bab.beta_crown.iterations: 8
+          bab.clip.interm_domain: true
+          bab.clip.in_alpha_crown: true
+
+  - name: vgg_recipe
+    year: 2025
+    category: vggnet16_2022
+    base_preset: configs/vnncomp25/vggnet16_2022.yaml
+    corpus_ids: [vgg16-spec1, vgg16-spec0-sentinel]
+    arms:
+      - name: baseline
+        overrides: {}
+      - name: skip_final_alpha_gradient
+        overrides: {}
+        env:
+          NY_ALPHA_FINAL_BOUND_ONLY: "1"
+        disposition: default_off_execution_treatment
+      - name: abcrown_treatment
+        overrides:
+          model.vgg_abcrown_treatment: true
+          solver.bound_prop_method: forward+backward
+          bab.branching.method: sb
+          bab.branching.input_split.enable: true
+          attack.pgd_order: input_bab

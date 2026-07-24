@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1a1570e0bcfee0dbde4aa16b25cc57805cb50d264c607ee1cb9fa61623223f80 # shrinks to l = 11.327968, delta = 7.9781976
+cc 7a51baf43244a85cf36234db61158dfd7f7e1996a9eb2c14c275b38a13e816e0 # shrinks to l = -2.623589, delta = 14.348656
+cc 16823bcf744a770fa64e5c71f7353241d6c0239916bfb91bb33a8987f80b4618 # shrinks to l = 0.4229016, delta = 19.662287
+cc 59ff145f2bc5cb1460faa6a152432af75b3115c582003d9c6231dac144aafc34 # shrinks to l0 = 0.0, d0 = 0.0, l1 = -6.1862965, d1 = 7.8533, lower_c0 = 0.0, lower_c1 = -3.7509897, delta_c0 = 0.0, delta_c1 = 0.0, lower_b = 0.0, delta_b = 1.7404387
+cc f24e31cbb891e7f472705037fe812f13c15890b159f936c2100de059f4cc22d8 # shrinks to l0 = -3.7282557, d0 = 4.8667073, l1 = 0.0, d1 = 0.0, c0 = -3.1326528, c1 = 0.0
+cc 1f285bec7a84181d33745ff3be2f4c10ebab1e97d66ad11c653171e8cba79d04 # shrinks to l0 = -1.066622, d0 = 2.4642348, l1 = 0.0, d1 = 0.0, c0 = -4.412523, c1 = 0.0
+cc f17c4421672d5c7adb2f97e529eec41ef459baa3e070c92812f12abb43d06d6e # shrinks to l0 = 0.0, d0 = 0.0, l1 = -5.909944, d1 = 8.084552, c0 = 0.0, c1 = -0.79207665
+cc 94afa78adae2bbc07f716538aac70156f8b229d114236cb87a8860faa4bf236d # shrinks to l0 = 0.0, d0 = 6.66021, l1 = 0.0, d1 = 0.0, c0 = -2.9085813, c1 = 0.0
+cc 994fbd5967b6c8ef8f33f10f1cc970a66c02a5ac6bb59dfdf631e37af1e4d796 # shrinks to l0 = 7.978117, d0 = 5.268609, l1 = 2.987162, d1 = 3.074456, c0 = 0.53057027, c1 = -3.6685884
+cc 19824ab824e2ca18bcab80ccb4d20abc670776f63482217e189bff4f9f053577 # shrinks to l = 1.0006411, delta = 9.841457
+cc 0954280c771a9360399a59e87f35ff7a4390e2a10cb0b0fbcd5dffc3c9c8212a # shrinks to x0 = 3.3117123

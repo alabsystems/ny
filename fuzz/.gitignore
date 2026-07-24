@@ -1,0 +1,22 @@
+target
+artifacts
+coverage
+Cargo.lock
+
+# Ignore all auto-generated corpus entries from libFuzzer
+corpus/*/*
+
+# Whitelist seed corpus files
+!corpus/vnnlib_parser/basic_bounds.vnnlib
+!corpus/vnnlib_parser/arithmetic_bounds.vnnlib
+!corpus/vnnlib_parser/or_output.vnnlib
+!corpus/vnnlib_parser/output_lower_bound.vnnlib
+!corpus/smt_model_parser/simple_define_fun.txt
+!corpus/smt_model_parser/rational.txt
+!corpus/smt_model_parser/negative.txt
+!corpus/smt_model_parser/define_fun_rec.txt
+!corpus/smt_model_parser/comments.txt
+!corpus/onnx_loader/identity_test.onnx
+!corpus/onnx_loader/abs_test.onnx
+!corpus/onnx_loader/clip_test.onnx
+!corpus/onnx_loader/const_activation_binary_op.onnx

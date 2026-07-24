@@ -1,0 +1,24 @@
+# Own workspace root: the ny root manifest `exclude`s this directory, so there is
+# no workspace to inherit `[workspace.package]` fields from — every field below
+# must be spelled out literally.
+[workspace]
+
+[package]
+name = "ny-kani-proofs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/ny"
+description = "ny-kani-proofs crate"
+publish = false
+
+# Kani proofs - compile-checked but not run without `cargo kani`
+# The `kani` crate is automatically injected by cargo-kani
+
+[dependencies]
+ny-core = { path = "../../crates/ny-core" }
+ny-relaxation = { path = "../../crates/ny-relaxation", features = ["kani-proofs"] }
+
+# The kani dependency is injected by cargo-kani at verification time.
+# For development/checking, we use cfg_attr to conditionally include kani macros.

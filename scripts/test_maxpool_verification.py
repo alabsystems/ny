@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+"""Test MaxPool2d verification using ny-propagate.
+
+This script tests the MaxPool2d implementation by verifying a simple
+Conv2d + ReLU + MaxPool2d network.
+"""
+
+import json
+import subprocess
+from pathlib import Path
+
+
+# Generate a simple CNN with MaxPool for testing
+def create_test_cnn_onnx():
+    """Create a test CNN ONNX model: Conv2d -> ReLU -> MaxPool2d -> Flatten -> Linear."""
+    try:
+        import onnx
+        import torch
+        import torch.nn as nn
+
+        class TestCNN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(1, 4, kernel_size=3, padding=1)
+                self.pool = nn.MaxPool2d(2, 2)
+                # After 8x8 input + conv(pad=1) -> 8x8, maxpool(2,2) -> 4x4
+                # 4 channels * 4 * 4 = 64
+                self.fc = nn.Linear(64, 2)
+
+            def forward(self, x):
+                x = torch.relu(self.conv(x))
+                x = self.pool(x)
+                x = x.view(x.size(0), -1)
+                x = self.fc(x)
+                return x
+
+        model = TestCNN()
+
+        # Use torch.jit for export with explicit settings
+        dummy_input = torch.randn(1, 1, 8, 8)
+
+        # Save as TorchScript first
+        ts_path = "tests/models/test_cnn_maxpool.pt"
+        Path(ts_path).parent.mkdir(parents=True, exist_ok=True)
+        with torch.no_grad():
+            traced = torch.jit.trace(model, dummy_input)
+            torch.jit.save(traced, ts_path)
+        print(f"Saved TorchScript model to {ts_path}")
+
+        # Manual ONNX creation using onnx helper
+        from onnx import TensorProto, helper, numpy_helper
+
+        # Get weights
+        with torch.no_grad():
+            conv_weight = model.conv.weight.numpy()
+            conv_bias = model.conv.bias.numpy()
+            fc_weight = model.fc.weight.numpy()
+            fc_bias = model.fc.bias.numpy()
+
+        # Create initializers
+        conv_w_init = numpy_helper.from_array(conv_weight, "conv_weight")
+        conv_b_init = numpy_helper.from_array(conv_bias, "conv_bias")
+        fc_w_init = numpy_helper.from_array(fc_weight, "fc_weight")
+        fc_b_init = numpy_helper.from_array(fc_bias, "fc_bias")
+
+        # Create nodes
+        conv_node = helper.make_node(
+            "Conv",
+            ["input", "conv_weight", "conv_bias"],
+            ["conv_out"],
+            kernel_shape=[3, 3],
+            pads=[1, 1, 1, 1]
+        )
+
+        relu_node = helper.make_node(
+            "Relu",
+            ["conv_out"],
+            ["relu_out"]
+        )
+
+        maxpool_node = helper.make_node(
+            "MaxPool",
+            ["relu_out"],
+            ["pool_out"],
+            kernel_shape=[2, 2],
+            strides=[2, 2]
+        )
+
+        flatten_node = helper.make_node(
+            "Flatten",
+            ["pool_out"],
+            ["flat_out"],
+            axis=1
+        )
+
+        gemm_node = helper.make_node(
+            "Gemm",
+            ["flat_out", "fc_weight", "fc_bias"],
+            ["output"],
+            transB=1
+        )
+
+        # Create graph
+        graph = helper.make_graph(
+            [conv_node, relu_node, maxpool_node, flatten_node, gemm_node],
+            "test_cnn_maxpool",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 8, 8])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])],
+            [conv_w_init, conv_b_init, fc_w_init, fc_b_init]
+        )
+
+        # Create model
+        model_proto = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 11)])
+
+        onnx_path = "tests/models/test_cnn_maxpool.onnx"
+        onnx.save(model_proto, onnx_path)
+        onnx.checker.check_model(model_proto)
+        print(f"Saved ONNX model to {onnx_path}")
+
+        return onnx_path, ts_path
+
+    except ImportError as e:
+        print(f"Warning: Could not create model: {e}")
+        return None, None
+
+
+def test_maxpool_verification(onnx_path):
+    """Test verification of CNN with MaxPool."""
+
+    # Create a simple VNN-LIB property
+    vnnlib_path = "tests/models/test_cnn_maxpool.vnnlib"
+    with open(vnnlib_path, 'w') as f:
+        # Input variables for 1x8x8 = 64 inputs
+        for i in range(64):
+            f.write(f"(declare-const X_{i} Real)\n")
+
+        # Output variables
+        f.write("(declare-const Y_0 Real)\n")
+        f.write("(declare-const Y_1 Real)\n")
+
+        # Input constraints: [0.4, 0.6] for all inputs
+        for i in range(64):
+            f.write(f"(assert (>= X_{i} 0.4))\n")
+            f.write(f"(assert (<= X_{i} 0.6))\n")
+
+        # Output: class 0 should be less than class 1 (adversarial property)
+        f.write("(assert (< Y_0 Y_1))\n")
+
+    print(f"Created VNN-LIB property: {vnnlib_path}")
+
+    # Run ny verify
+    result = subprocess.run(
+        ["cargo", "run", "--release", "-p", "ny-cli", "--",
+         "verify", onnx_path,
+         "--property", vnnlib_path,
+         "--method", "ibp",
+         "--output-format", "json"],
+        capture_output=True,
+        text=True,
+        cwd="."
+    )
+
+    print("\n=== ny verify output ===")
+    print(result.stdout)
+    if result.stderr:
+        print("stderr:", result.stderr)
+
+    # Parse result
+    try:
+        output = json.loads(result.stdout)
+        print(f"\nVerification status: {output.get('status', 'unknown')}")
+        print(f"Method: {output.get('method', 'unknown')}")
+        if 'bounds' in output:
+            print(f"Output bounds: {output['bounds']}")
+    except json.JSONDecodeError:
+        print("Could not parse JSON output")
+
+
+def test_maxpool_ibp():
+    """Direct test of MaxPool2d IBP propagation using Rust CLI."""
+
+    # Build and run a simple test through the CLI
+    result = subprocess.run(
+        ["cargo", "test", "-p", "ny-propagate", "--",
+         "test_maxpool2d", "--nocapture"],
+        capture_output=True,
+        text=True,
+        cwd="."
+    )
+
+    print("=== MaxPool2d Unit Tests ===")
+    print(result.stdout)
+    if result.returncode != 0:
+        print("stderr:", result.stderr)
+        return False
+
+    return "6 passed" in result.stdout
+
+
+def main():
+    print("Testing MaxPool2d verification support\n")
+
+    # Test 1: Run unit tests
+    print("1. Running MaxPool2d unit tests...")
+    if test_maxpool_ibp():
+        print("   PASS: All MaxPool2d unit tests passed\n")
+    else:
+        print("   FAIL: Unit tests failed\n")
+        return
+
+    # Test 2: Create and verify CNN with MaxPool
+    print("2. Creating test CNN with MaxPool2d...")
+    onnx_path, ts_path = create_test_cnn_onnx()
+
+    if onnx_path:
+        print("\n3. Testing verification with MaxPool2d...")
+        test_maxpool_verification(onnx_path)
+    else:
+        print("   Skipping ONNX verification test (PyTorch not available)")
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

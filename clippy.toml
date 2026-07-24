@@ -1,0 +1,25 @@
+# Clippy configuration for alabsystems Rust projects
+#
+# Copy to project root as clippy.toml or .clippy.toml
+# Run: cargo clippy -- -D warnings
+#
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+
+# This file configures Clippy behavior knobs only.
+# Lint levels (deny/warn/allow) must be set via either:
+#   1) source-level #![deny(...)] attributes (see templates/rust_lint_attrs.rs), or
+#   2) Cargo.toml [lints] configuration (see templates/cargo_lints.toml).
+
+# Large enum variant threshold (bytes)
+enum-variant-size-threshold = 64
+
+# COMPILE-TIME ENV WALL (2026-07-20): process-global env mutation races
+# parallel tests and verified readers. Every mutation must route through the
+# owning crate's blessed serialized helper (ScopedEnvVar / with_serialized_env_vars
+# / EnvEditor pattern); only those helper internals carry
+# #[allow(clippy::disallowed_methods)].
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "process-global mutation races parallel tests and verified readers; route through the crate's ScopedEnvVar/with_serialized_env_vars lock helper" },
+    { path = "std::env::remove_var", reason = "same as set_var" },
+]

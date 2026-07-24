@@ -1,0 +1,48 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# nn4sys GPU-BaB sidecar for #4406 DomainList promotion measurement.
+# Mirrors nn4sys.yaml but forces the benchmark lane onto the DomainList
+# path via `--gpu-bab`.
+#
+# Usage:
+#   target/release/ny beta-crown <model> --property <spec> \
+#     --preset configs/vnncomp25/nn4sys_gpu_bab.yaml --gpu-bab --json
+#
+# This sidecar is loaded standalone via `--preset`, so it does not inherit
+# nn4sys.yaml automatically — all config values are duplicated here.
+# Part of #4406.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/nn4sys
+  csv_name: instances.csv
+
+solver:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  bound_prop_method: forward+crown
+
+attack:
+  pgd_order: skip
+  pgd_restarts: 10
+
+bab:
+  batch_size: 64
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 0.1
+      reorder_bab: true
+  clip:
+    relaxed: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

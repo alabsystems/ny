@@ -1,0 +1,13 @@
+# VNN-COMP benchmark directories (download separately). No trailing slash:
+# a checkout may be a SYMLINK to a shared sparse clone (e.g. /tmp/vc25), and
+# `dir/` patterns do not match symlinks.
+vnncomp2021
+vnncomp2022
+vnncomp2023
+vnncomp2024
+vnncomp2025
+
+# Test results
+*.json
+!abcrown_transfer_corpus_v1.json
+results/

@@ -1,0 +1,48 @@
+[package]
+name = "ny-mip"
+description = "MIP/LP solving for neural network verification (ay backend)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+ny-cert = { path = "../ny-cert" }
+
+# ay-milp is the in-process MILP/LP backend, rev-pinned to a commit SHA
+# (never a floating branch); see docs/SOLVER_POLICY.md. Engine-dependent lanes
+# must verify that the revision contains the features their budget model uses.
+ay-milp = { git = "https://github.com/alabsystems/ay.git", rev = "d766b0365d2cf614428bfea6debb8c02a815f384" }
+num-bigint.workspace = true
+num-rational = "0.4"
+num-traits = "0.2"
+
+thiserror.workspace = true
+tracing.workspace = true
+ndarray.workspace = true
+# Dense float Cholesky (LLT) for the certified-Cholesky lambda_min route of the
+# unwired verified-SDP-bound primitive. Used only to PROPOSE a factor; the bound
+# itself is certified a-posteriori by outward-rounded residual enclosure.
+faer.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils" }
+ntest.workspace = true
+proptest.workspace = true
+
+# No required-features: every mip-diff mode (lib-vs-proc diff, --certify)
+# works in the default build.
+[[bin]]
+name = "mip-diff"
+path = "src/bin/mip-diff.rs"

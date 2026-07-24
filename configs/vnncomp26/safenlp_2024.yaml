@@ -1,0 +1,113 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# safenlp_2024 VNN-COMP 2026 benchmark config
+#
+# Benchmark characteristics:
+# - SafeNLP NLP-safety verification. Two tiny sequential FC+ReLU nets
+#   (medical, ruarobot), each 30 inputs -> 2 outputs (~18KB ONNX).
+# - 1080 instances, 20s timeout each. Output property: Y[0,0] <= Y[0,1]
+#   (newer vnnlib-version <2.0> declare-network format).
+# - Mix of SAT (PGD falsifies instantly) and UNSAT (needs exact MIP — plain
+#   CROWN/IBP is too loose; the engine logs "fast CROWN ... falling back to IBP"
+#   on these). Previous ny gap: ~345 UNSAT instances scored `unknown` when the
+#   MIP escalation was not reached.
+#
+# CRITICAL SCHEMA NOTE — `complete_verifier: mip`:
+# - The reference alpha-beta-CROWN config
+#   (vnncomp24/safenlp.yaml) sets `general.complete_verifier: mip` to force the
+#   exact MIP backend; that is what recovers the UNSAT instances.
+# - ny's PresetConfig schema has NO `complete_verifier` key (it is not a tunable
+#   preset field). Instead, the scored VNN-COMP runner ALWAYS invokes the engine
+#   with `CompleteVerifierArg::Auto` + the default MIP solver — the ay backend,
+#   the ONLY solver in ny (docs/SOLVER_POLICY.md; HiGHS was deleted at LG3) —
+#   see crates/ny-cli/src/commands/vnncomp.rs `invoke_beta_crown`
+#   (`None::<MipSolverArg>` = default `AY`, the in-process ay-milp session).
+#   `Auto` runs BaB and then escalates to the ay exact-MIP complete verifier
+#   whenever BaB is inconclusive AND the net is MIP-encodable (sequential
+#   Linear+ReLU within a size cap) — which these 30->2 nets satisfy. So MIP
+#   escalation is ALREADY enabled for this category, equivalent to the
+#   reference's complete_verifier=mip, and there is intentionally nothing to
+#   set here for it. NOTE: the escalation exists only in `--features mip`
+#   builds; without the feature it is silently discarded (defect #4,
+#   docs/BANKING_SWEEP_2026-07-18.md) — competition builds must enable it.
+#
+# MEASURED (2026-07-18, ay backend, --features mip;
+# docs/BANKING_SWEEP_2026-07-18.md ruarobot arc):
+#   SAT instances   -> `sat` fast (up-front PGD finds the violation).
+#   UNSAT instances -> `unsat` is NOT currently reachable in the 20s budget:
+#     the 4 open safenlp ruarobot instances (PGD margin +1.05 = robustly safe,
+#     root -4.75, <=128 unstable ReLUs = trivially MIP-encodable) still time
+#     out locally even with defects #4 (non-mip build discards escalation) and
+#     #5 (auto-input-split overrode the pinned max_domains, starving the MIP
+#     phase below its 8s floor) fixed. MIP-phase wall-clock on this machine vs
+#     the previously recorded 7-8s HiGHS-era sample is the open question
+#     (next arc: preset-loading + MIP wall-clock trace). Near-deadline ay
+#     solves that used to overshoot the slice (SMT-fallback BigRational loop)
+#     are now hard-bounded at the slice from outside the session
+#     (crates/ny-mip/src/ay_lib.rs `run_with_hard_deadline`), so budget
+#     exhaustion scores a clean in-budget `unknown`, never a watchdog kill.
+#   The 2026-06-15 "ZERO unknown / unsat in 7-8s" sample predates the HiGHS
+#   deletion and does not describe the current ay backend.
+#
+# Tuning: keep the reference's strong PGD sweep for the SAT instances. NOTE:
+# ny does not implement the reference's after-BaB ordering — pgd_order=after
+# only ENABLES PGD, which then runs on the default UPFRONT schedule
+# (apply_preset warns about exactly this; the VERIFIED block above records the
+# up-front behavior). 10000 restarts matches the reference.
+#
+# PHASE BUDGET + max_domains (2026-07 gap probe, official budget = 20s/instance,
+# internal ny timeout = 15s after the runner's grace tier):
+# - NOTE this file (vnncomp26/) is the one the runner actually loads for
+#   safenlp_2024: preset dirs resolve NEWEST-FIRST, so vnncomp26 shadows
+#   vnncomp25 (crates/ny-cli/src/commands/vnncomp.rs vnncomp_dirs_newest_first).
+# - Diagnosis: on the ~unknown UNSAT instances the per-constraint BaB phase
+#   never converges and runs to its deadline, so the exact-MIP escalation
+#   (then HiGHS; now the ay backend — timing under ay is the open question in
+#   the MEASURED block above) starts with almost no wall-clock left inside
+#   the 20s budget -> scored unknown/timeout.
+#   Probe (this worktree, release binary): medical/hyperrectangle_1739 and
+#   ruarobot/hyperrectangle_1181 = timeout at 20s without this block, unsat in
+#   46s/91s when given 120s — the verdict is reachable, just not in-budget.
+# - max_domains caps the BaB phase on these tiny nets so it EXITS early as
+#   inconclusive instead of burning the whole budget; Auto then escalates to
+#   MIP with most of the budget still remaining. 4000 domains is a few seconds
+#   of CPU BaB on a 30-input FC net — enough for the easy UNSAT proofs BaB
+#   does close quickly, small enough to leave >=8s for MIP.
+#   Budget/order-only change: BaB exiting early is always sound (inconclusive
+#   -> escalate), and MIP is an exact complete verifier.
+# - mip_min_fraction/mip_min_secs guarantee the MIP phase a usable floor
+#   (clamp(0.65*15s, 8, 30) = 9s) even if BaB overruns its share.
+# - upfront_pgd_fraction stays modest: SAT instances fall to PGD in <0.1s, so
+#   the attack phase never needs more than ~1.5s of a 15s internal budget.
+
+general:
+  root_path: ../../benchmarks/vnncomp2026/benchmarks/safenlp_2024/2.0
+  csv_name: instances.csv
+
+attack:
+  pgd_order: after
+  pgd_restarts: 10000
+
+bab:
+  # MEASURED 2026-07-20 (git-bisect + max_domains sweep, release mip binary):
+  # the 4000 early-exit pin (8b151134) REGRESSED 9 banked unsat rows
+  # (hyperrectangle 4785/11/328/3009/1154/5185/2900/469/2110, unsat@9-14s on
+  # the Jul-16 bank) — those proofs come from the LONG BaB phase (~35k-50k
+  # domains), and the MIP escalation the early exit was buying never closes
+  # them in-budget. Sweep: 4000/12000/20000 lose the unsats; >=35000 wins the
+  # unsats but starves the post-BaB attack window that wins the 8 razor-thin
+  # SAT rows (1997/2068/2893/2895/6241/869/2710/2714). The zero-sum is broken
+  # by NY_UPFRONT_ATTACK=1 (scoped to this category in run_instance.sh): the
+  # upfront gradient lane wins the razor-thin SATs in its ~1.6s slice BEFORE
+  # BaB, so the full budget stays with the UNSAT proof. Combined config
+  # measured 6/6 on the discriminating rows (3 unsat + 3 sat).
+  max_domains: 50000
+  phase_budget:
+    # Guarantee MIP the dominant share of the 20s budget: floor at
+    # max(0.65*total, 8s) (ceiling stays at the 30s default).
+    mip_min_fraction: 0.65
+    mip_min_secs: 8
+    # Modest upfront attack cap; PGD finds SAT witnesses in <0.1s here.
+    upfront_pgd_fraction: 0.10

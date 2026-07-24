@@ -1,0 +1,282 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ny-api",
+    "crates/ny-build",
+    "crates/ny-core",
+    "crates/ny-load",
+    "crates/ny-relaxation",
+    "crates/ny-tensor",
+    "crates/ny-propagate",
+    "crates/ny-onnx",
+    "crates/ny-cli",
+    "crates/ny-gpu",
+    "crates/ny-mip",
+    "crates/ny-python",
+    "crates/ny-test-utils",
+    "crates/ny-cert",
+    "crates/ny-trace-bridge",
+    "crates/ny-contracts",
+    "crates/ny-cuda",
+    "crates/ny-groundtruth",
+    "crates/ny-lint-guard",
+]
+# Kani proofs excluded: verified separately with `cargo kani`
+exclude = ["proofs/kani", "fuzz"]
+# Exclude Python extension from default builds (use maturin instead)
+default-members = [
+    "crates/ny-build",
+    "crates/ny-core",
+    "crates/ny-load",
+    "crates/ny-tensor",
+    "crates/ny-propagate",
+    "crates/ny-onnx",
+    "crates/ny-cli",
+    "crates/ny-gpu",
+    "crates/ny-mip",
+    "crates/ny-groundtruth",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/ny"
+# MSRV tracks the pinned toolchain (rust-toolchain.toml), the only version the
+# workspace is built and tested against. The source floor is set by the source
+# itself, not by the lockfile: bound propagation calls `f64::next_up`/`next_down`
+# for directed rounding (`float_next_up_down`, stable 1.86), well above anything
+# Cargo.lock requires (prost 0.14.4 → 1.85, half 2.7.1 → 1.81). Lowering this
+# below the pin means claiming support for a toolchain nothing exercises.
+rust-version = "1.95"
+
+readme = "README.md"
+[workspace.lints.rust]
+dead_code = "warn"
+# Kani model checker sets the `kani` cfg flag for proof-only code.
+# tRustc sets the `trust_verify` cfg flag when contract verification is active
+# (`targo trust ... --contracts`), gating the first-class `core::contracts` import.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(trust_verify)'] }
+# unreachable_pub deferred — 119+ violations in ny-propagate alone.
+# Tracked for incremental tightening as remaining pub items are pruned.
+# unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_import_braces = "warn"
+unused_macro_rules = "warn"
+non_ascii_idents = "forbid"
+# Edition-2024 hygiene (adopted from ay): no identifiers that become keywords in 2024.
+keyword_idents_2024 = "forbid"
+
+[workspace.lints.clippy]
+# === Group enables ===
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -2 }
+nursery = { level = "warn", priority = -3 }
+
+# === Restriction lints — cherry-picked for real bugs ===
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+empty_drop = "warn"
+empty_structs_with_brackets = "warn"
+
+# === Pedantic allows — adapted from ay, tuned for tensor/propagation code ===
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+too_many_arguments = "allow"
+implicit_hasher = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+single_match_else = "allow"
+wildcard_imports = "allow"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+needless_continue = "allow"
+if_not_else = "allow"
+needless_raw_string_hashes = "allow"
+used_underscore_binding = "allow"
+return_self_not_must_use = "allow"
+cast_possible_truncation = "allow"    # Numeric tensor code — tracked by #3012
+cast_possible_wrap = "allow"          # Same rationale
+cast_sign_loss = "allow"              # Same rationale
+cast_precision_loss = "allow"         # Same rationale
+cast_lossless = "allow"              # f32→f64 widening is intentional in bound arithmetic
+uninlined_format_args = "allow"      # Style-only, 500+ sites, not a bug risk
+redundant_closure_for_method_calls = "allow"  # Style preference, ay also allows
+cloned_instead_of_copied = "allow"   # Style preference
+use_self = "allow"                   # Style preference, 333 sites in propagate alone
+unreadable_literal = "allow"
+match_bool = "allow"
+inline_always = "allow"
+redundant_else = "allow"
+manual_let_else = "allow"
+match_same_arms = "allow"
+unused_self = "allow"
+single_char_pattern = "allow"
+many_single_char_names = "allow"      # Math code uses x, y, a, b, l, u
+trivially_copy_pass_by_ref = "allow"
+needless_pass_by_value = "allow"
+match_wildcard_for_single_variants = "allow"
+semicolon_if_nothing_returned = "allow"
+struct_field_names = "allow"
+unnested_or_patterns = "allow"
+only_used_in_recursion = "allow"
+self_only_used_in_recursion = "allow"  # Same as above, but for &self methods
+tuple_array_conversions = "allow"      # False positives on [a, b, c] from destructured tuples
+too_long_first_doc_paragraph = "allow" # Doc paragraph length is subjective
+if_then_some_else_none = "allow"
+comparison_chain = "allow"
+unnecessary_wraps = "allow"
+ref_option = "allow"
+no_effect_underscore_binding = "allow"
+verbose_bit_mask = "allow"
+range_minus_one = "allow"
+assigning_clones = "allow"
+format_push_string = "allow"
+float_cmp = "allow"                   # Exact float comparison intentional in bound arithmetic
+needless_pass_by_ref_mut = "allow"
+debug_assert_with_mut_call = "allow"
+type_complexity = "allow"
+bool_to_int_with_if = "allow"
+map_unwrap_or = "allow"
+needless_collect = "allow"
+same_functions_in_if_condition = "allow"
+cloned_ref_to_slice_refs = "allow"
+needless_borrows_for_generic_args = "allow"
+default_trait_access = "allow"
+unnecessary_map_or = "allow"
+iter_on_single_items = "allow"
+explicit_iter_loop = "allow"
+needless_range_loop = "allow"         # Tensor indexing: d indexes multiple arrays simultaneously
+needless_for_each = "allow"          # Style preference, 20+ sites
+collection_is_never_read = "warn"
+
+# === Nursery allows ===
+suboptimal_flops = "allow"            # Explicit mul+add in bound arithmetic is intentional
+imprecise_flops = "allow"            # expm1/ln_1p suggestions not appropriate for bound code
+missing_const_for_fn = "allow"
+option_if_let_else = "allow"
+cognitive_complexity = "allow"
+significant_drop_tightening = "allow"
+branches_sharing_code = "allow"
+fallible_impl_from = "allow"
+useless_let_if_seq = "allow"
+or_fun_call = "allow"
+suspicious_operation_groupings = "allow"  # False positives on quadratic math (x*x - s*x)
+redundant_pub_crate = "allow"         # Conflicts with unreachable_pub
+unnecessary_literal_bound = "allow"   # Trait methods return &str, not &'static str
+future_not_send = "allow"            # wgpu types are !Send by design
+unused_async = "allow"               # Async scaffolding for wgpu device methods
+
+[workspace.dependencies]
+# Core
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Tensor operations - matrixmultiply provides fast matrix ops
+# On macOS, ndarray/blas + blas-src/accelerate routes dot() through Accelerate.framework BLAS.
+# The base feature set is platform-neutral; macOS crates add blas via target-specific deps.
+ndarray = { version = "0.17", features = ["rayon", "serde", "matrixmultiply-threading"] }
+blas-src = { version = "0.14", features = ["accelerate"] }
+
+# High-performance linear algebra (competitive with BLAS, pure Rust)
+faer = "0.24"
+num-traits = "0.2"
+# Arbitrary-precision exact rationals (ny-cert proof-carrying certificates).
+num-bigint = "0.4"
+num-rational = "0.4"
+# NY-owned stable-Rust compatibility attributes for contract-annotated sources.
+# The package is `ny-contracts`, while its lib remains named `trust` so existing
+# `#[trust::requires/ensures]` paths work. These macros are no-ops; verification
+# belongs to the separately installed Trust toolchain.
+trust = { package = "ny-contracts", path = "crates/ny-contracts" }
+rayon = "1.10"
+libm = "0.2"
+rand = "0.10"
+
+# GPU acceleration
+wgpu = "29"  # Upgraded from 24 for cross-crate consistency
+pollster = "0.4"  # For blocking on async wgpu calls
+bytemuck = { version = "1.20", features = ["derive"] }
+
+# ONNX support
+ort = "2.0.0-rc.12"  # ONNX Runtime bindings
+prost = "0.14"
+
+# SafeTensors support
+safetensors = "0.7"
+
+# PyTorch support (for loading .pt/.pth files)
+candle-core = { version = "0.10", default-features = false }
+
+# CoreML support (for loading .mlpackage/.mlmodel files)
+coreml-proto = "0.1"
+
+# GGUF support (for loading llama.cpp .gguf files)
+gguf = "0.1"
+
+# Memory-mapped file I/O (for efficient large model loading)
+memmap2 = "0.9"
+
+# Zip archive support (for PyTorch nested models)
+zip = "4.2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+approx = "0.5"
+proptest = "1"
+ntest = "0.9"
+
+# Temporary files
+tempfile = "3.20"
+
+# NumPy interop
+npyz = "0.8"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Cryptographic hashing (SHA256 for model fingerprinting)
+sha2 = "0.10"
+
+# Half-precision floats
+half = { version = "2.4", features = ["num-traits", "serde"] }
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind"
+overflow-checks = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+[workspace.metadata.atpkg]
+# The binaries atpkg shims onto PATH when `ny` is installed (its user-facing commands).
+# Read by aterm-toolchain-index tooling (tools/atpkg-pack.sh). The `ny` command is the sole
+# public bin (crate ny-cli); every other src/bin/ target is an internal engine helper.
+expose = ["ny"]

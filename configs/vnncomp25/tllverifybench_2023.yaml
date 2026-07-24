@@ -1,0 +1,57 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# tllverifybench_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Two-Level Lattice (TLL) NNs: 2-D input, one scalar output, wide
+#   Linear+ReLU min/max lattice layers (N=M=8..64), 32 instances, 600s each.
+# - Property is a single output threshold; official tools (alpha-beta-CROWN,
+#   cora, neuralsat, pyrat) close the N=40..56 UNSAT instances in 10-146s via
+#   input-split BaB.
+#
+# Why this preset exists (2026-07, gap probe):
+# - There was NO tllverifybench preset, so the runner fell back to auto
+#   defaults: reports/measured/tllverifybench_2023.csv shows every N>=40
+#   instance timing out at ~575s (600s budget) while alpha-beta-CROWN proves
+#   the same instances unsat in ~10s.
+# - Probe-verified recipe: 2-D input => input-split BaB with the cheap
+#   forward+crown bounds (the nn4sys/linearizenn recipe for low-dim inputs).
+#   With this preset, property_N=40_0 flips timeout -> unsat well inside the
+#   budget (see commit message for probe timings).
+#
+# device: cpu is LOAD-BEARING — do NOT route this shape to the GPU backend.
+# Probe measurement showed the wgpu lane is ~20x slower per input-split domain
+# on these small-but-wide TLL layers (dispatch overhead dominates; the CPU
+# lane batches thousands of 2-D domains through forward+crown far faster).
+#
+# Budget/routing tuning only: nothing here touches verdict-critical math.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/tllverifybench_2023
+  csv_name: instances.csv
+  device: cpu
+
+solver:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  # forward+crown: forward bounds for the wide intermediate lattice layers +
+  # CROWN backward for the scalar output — the supported preset mode that is
+  # empirically tight enough once the 2-D input box is split (same recipe as
+  # nn4sys.yaml / linearizenn_2024.yaml).
+  bound_prop_method: forward+crown
+
+bab:
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 0.1
+      reorder_bab: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

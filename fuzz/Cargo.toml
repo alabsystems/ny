@@ -1,0 +1,54 @@
+[package]
+name = "ny-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+ndarray = "0.17"
+
+[dependencies.ny-onnx]
+path = "../crates/ny-onnx"
+
+[dependencies.ny-core]
+path = "../crates/ny-core"
+
+[dependencies.ny-propagate]
+path = "../crates/ny-propagate"
+
+[dependencies.ny-tensor]
+path = "../crates/ny-tensor"
+
+[[bin]]
+name = "vnnlib_parser"
+path = "fuzz_targets/vnnlib_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onnx_loader"
+path = "fuzz_targets/onnx_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "linear_bounds_concretize"
+path = "fuzz_targets/linear_bounds_concretize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bound_propagation_soundness"
+path = "fuzz_targets/bound_propagation_soundness.rs"
+test = false
+doc = false
+bench = false

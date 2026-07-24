@@ -1,0 +1,21 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+# Minimal ny verify YAML config (alpha-beta-CROWN compatible layout)
+
+general:
+  root_path: .
+  device: cpu
+
+model:
+  path: models/mnist.onnx
+
+specification:
+  vnnlib_path: specs/mnist.vnnlib
+  epsilon: 0.01
+
+solver:
+  propagation:
+    method: alpha
+    max_iterations: 100
+    tolerance: 1e-4

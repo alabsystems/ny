@@ -1,0 +1,13 @@
+# Local-durable, not committed: 573 MB of affine-map dumps (rebuildable from
+# the in-repo ONNX via tools/provenance/build_block_maps*.py), raw probe
+# dumps, and the large instance forms (regenerable via tools/emit_hard_six.py;
+# raw sha256 identity anchors in README.md).
+maps/
+probe-logs/
+instances/*
+# Committed turnkey set: MEDIUM w2 (dec + milp) + the measured HiGHS-LP-death
+# w5 rung (dec).
+!instances/*_w2_dec.smt2.zst
+!instances/*_w2.milp.zst
+!instances/*_w5.milp.zst
+!instances/cifar100med_prop8945_dom1_d8_r99-67_w5_dec.smt2.zst

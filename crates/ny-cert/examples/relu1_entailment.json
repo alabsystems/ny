@@ -1,0 +1,158 @@
+{
+  "conclusion": {
+    "coefficients": {
+      "y": "1"
+    },
+    "constant": "0",
+    "kind": "ge",
+    "type": "linear_constraint"
+  },
+  "multipliers": [
+    "0",
+    "0",
+    "0",
+    "1",
+    "0",
+    "1/2",
+    "1/2",
+    "0",
+    "1",
+    "0",
+    "0",
+    "1",
+    "0",
+    "1"
+  ],
+  "premises": [
+    {
+      "coefficients": {
+        "x0": "1"
+      },
+      "constant": "1",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x0": "1"
+      },
+      "constant": "-1",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x1": "1"
+      },
+      "constant": "1",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x1": "1"
+      },
+      "constant": "-1",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x0": "-1",
+        "x1": "-1",
+        "z0": "1"
+      },
+      "constant": "0",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x0": "-1",
+        "x1": "-1",
+        "z0": "1"
+      },
+      "constant": "0",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x0": "-1",
+        "x1": "1",
+        "z1": "1"
+      },
+      "constant": "0",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "x0": "-1",
+        "x1": "1",
+        "z1": "1"
+      },
+      "constant": "0",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a0": "1",
+        "z0": "-1/2"
+      },
+      "constant": "0",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a0": "1",
+        "z0": "-1/2"
+      },
+      "constant": "1",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a1": "1",
+        "z1": "-1/2"
+      },
+      "constant": "0",
+      "kind": "ge",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a1": "1",
+        "z1": "-1/2"
+      },
+      "constant": "1",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a0": "-1",
+        "a1": "1",
+        "y": "1"
+      },
+      "constant": "5/2",
+      "kind": "le",
+      "type": "linear_constraint"
+    },
+    {
+      "coefficients": {
+        "a0": "-1",
+        "a1": "1",
+        "y": "1"
+      },
+      "constant": "5/2",
+      "kind": "ge",
+      "type": "linear_constraint"
+    }
+  ],
+  "type": "entailment_certificate",
+  "version": "1.0"
+}

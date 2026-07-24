@@ -1,0 +1,41 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default-off VGG canary aligned with alpha-beta-CROWN's current vggnet16
+# treatment. It deliberately preserves every shipped NY root optimization
+# from vggnet16_2022.yaml (wgpu plus the 15%/10%/10% phase budgets).
+#
+# Treatment-only differences:
+# - exact eligible 2x2 MaxPool -> Conv/ReLU(/Add) decomposition;
+# - SB input splitting;
+# - forward+backward for <=100 perturbed inputs, plain CROWN above 100;
+# - input-BaB PGD scheduling, promoted to upfront PGD above 10,000 inputs.
+#
+# This file is not selected by the VNN-COMP category map. Use it explicitly
+# for sealed A/B runs.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/vggnet16_2022
+  csv_name: instances.csv
+  device: wgpu
+
+model:
+  vgg_abcrown_treatment: true
+
+solver:
+  bound_prop_method: forward+backward
+
+bab:
+  batch_size: 1
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    disjunctive_pgd_fraction: 0.10
+    post_bab_pgd_fraction: 0.10
+  branching:
+    method: sb
+    input_split:
+      enable: true
+
+attack:
+  pgd_order: input_bab

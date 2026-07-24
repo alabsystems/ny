@@ -1,0 +1,823 @@
+NyVerdictAdmission — TY model-check receipt
+===========================================
+Date: 2026-07-10T16:47:22Z
+Checker: ty (tla-cli), release build of 34c97744 2026-07-06
+Binary: ty (TLA model checker)
+tla 0.10.0
+Invocation (from repo root):
+  ty check specs/tla/NyVerdictAdmission.tla --config <cfg> --workers 1
+
+Artifact hashes (sha256):
+027f132414dc3bbfa4bf644abc432552832adb1707a1159e6e0178de5f286bcc  specs/tla/NyVerdictAdmission.tla
+cce1dc11e274eaae911e095cd0457a5a71e91df76265bf9de18d9df99e982ab0  specs/tla/NyVerdictAdmission.cfg
+f5e4577d7fd7b036067e3864e707c4c7ad868c4cffbc605fbc3795246d47cdda  specs/tla/NyVerdictAdmission.bug_scip_pin.cfg
+d456265460798a5448d37c67580f1f0b71819d0818c28637704747950e9d5ab4  specs/tla/NyVerdictAdmission.bug_phantom_mip.cfg
+185e60c809db248c07a07d9e1c40c9405a84b805dc227570d812dad0b560fdba  specs/tla/NyVerdictAdmission.bug_unchecked_drat.cfg
+51f5590654ef44048930da814aebae9a125ceacc0c8cdf3fa8ed9dc9b0395ec4  specs/tla/NyVerdictAdmission.bug_skip_ort.cfg
+36d07855a5907431820f747b47a7b836674c834e58f3ff2a3f55f6522553d61b  specs/tla/NyVerdictAdmission.bug_unsound_gpu.cfg
+
+SUMMARY
+-------
+clean (all Bug*=FALSE):        PASS — exhaustive, 16176 states, 480 initial, 22528 transitions,
+                               invariants TypeOK GateContract AdmissionSound SatGated NoSilentLaneLoss EmitComplete: NO ERRORS.
+                               (4 dead actions = exactly the fault-injection actions — vacuous by design.)
+bug_scip_pin:                  EXPECTED FAIL — NoSilentLaneLoss violated (the historical config-only SCIP pin; 4-state trace).
+bug_phantom_mip:               EXPECTED FAIL — AdmissionSound violated (verdict via compiled-out MIP lane).
+bug_unchecked_drat:            EXPECTED FAIL — AdmissionSound violated (Verified on unchecked DRAT).
+bug_skip_ort:                  EXPECTED FAIL — SatGated violated (sat scored without ORT + f64 gates).
+bug_unsound_gpu:               EXPECTED FAIL — AdmissionSound violated (fast f32 GPU backward decided under engaged gate).
+
+================================================================
+FULL OUTPUT: clean
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: TypeOK, GateContract, AdmissionSound, SatGated, NoSilentLaneLoss, EmitComplete
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Warning: vacuous: 4 dead action(s) (never fired): CnfUnsatUnchecked, MipPhantomLane, GpuRouteGateBypassed, SatGateSkipped
+Model checking complete: No errors found (exhaustive).
+
+Statistics:
+  States found: 16176
+  Initial states: 480
+  Transitions: 22528
+  Max queue depth: 3792
+  Time: 1.232s
+
+Fingerprint collision probability (optimistic): 6.0E-12
+
+Detected actions (28):
+  StartDispatch
+  CnfFallThrough
+  CnfUnsatDratChecked
+  CnfUnsatUnchecked
+  CnfSatCandidate
+  CellFallThrough
+  CellUnsatFullCoverage
+  CellSatCandidate
+  CellTimeout
+  MipUnavailable
+  MipPhantomLane
+  MipUnsat
+  MipSatCandidate
+  MipInconclusive
+  BabResolveGpuRoute
+  GpuRouteSound
+  GpuRouteCpuFallback
+  GpuRouteUngated
+  GpuRouteGateBypassed
+  BabUnsat
+  BabSatCandidate
+  BabEscalateToMip
+  BabInconclusive
+  SatAdmitted
+  SatDowngraded
+  SatGateSkipped
+  EmitVerdict
+  Terminated
+
+Storage:
+  Memory states: 16176
+  Disk states: 0
+  Memory reserved: 0.3 MB
+
+================================================================
+FULL OUTPUT: bug_scip_pin
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.bug_scip_pin.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: NoSilentLaneLoss
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Error: Invariant NoSilentLaneLoss is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = TRUE
+/\ ort_confirmed = FALSE
+/\ pc = "Init"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = TRUE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 2: <StartDispatch line 151, col 6 to line 156, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = TRUE
+/\ ort_confirmed = FALSE
+/\ pc = "CnfRoute"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = TRUE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 3: <CnfFallThrough line 169, col 6 to line 174, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = TRUE
+/\ ort_confirmed = FALSE
+/\ pc = "MipOnly"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = TRUE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 4: <MipUnsat line 307, col 6 to line 315, col 40 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = TRUE
+/\ ort_confirmed = FALSE
+/\ pc = "Emit"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = TRUE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "unsat"
+/\ verdict_lane = "mip"
+/\ witness_confirmed_inproc = FALSE
+
+
+Statistics:
+  States found: 3685
+  Initial states: 480
+  Transitions: 3205
+  Time: 0.163s
+
+Storage:
+  Memory states: 3685
+  Disk states: 0
+  Memory reserved: 0.1 MB
+Error: Invariant violation detected
+
+================================================================
+FULL OUTPUT: bug_phantom_mip
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.bug_phantom_mip.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: AdmissionSound
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Error: Invariant AdmissionSound is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Init"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 2: <StartDispatch line 151, col 6 to line 156, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "CnfRoute"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 3: <CnfFallThrough line 169, col 6 to line 174, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "MipOnly"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 4: <MipPhantomLane line 286, col 6 to line 294, col 61 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Emit"
+/\ preset_loaded = TRUE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = TRUE
+/\ scip_compiled = FALSE
+/\ seq_model = TRUE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "unsat"
+/\ verdict_lane = "mip"
+/\ witness_confirmed_inproc = FALSE
+
+
+Statistics:
+  States found: 2437
+  Initial states: 480
+  Transitions: 1958
+  Time: 0.092s
+
+Storage:
+  Memory states: 2438
+  Disk states: 0
+  Memory reserved: 0.0 MB
+Error: Invariant violation detected
+
+================================================================
+FULL OUTPUT: bug_unchecked_drat
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.bug_unchecked_drat.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: AdmissionSound
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Error: Invariant AdmissionSound is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Init"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 2: <StartDispatch line 151, col 6 to line 156, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "CnfRoute"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 3: <CnfUnsatUnchecked line 191, col 6 to line 199, col 61 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Emit"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "unsat"
+/\ verdict_lane = "cnf"
+/\ witness_confirmed_inproc = FALSE
+
+
+Statistics:
+  States found: 969
+  Initial states: 480
+  Transitions: 491
+  Time: 0.044s
+
+Storage:
+  Memory states: 971
+  Disk states: 0
+  Memory reserved: 0.0 MB
+Error: Invariant violation detected
+
+================================================================
+FULL OUTPUT: bug_skip_ort
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.bug_skip_ort.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: SatGated
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Error: Invariant SatGated is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Init"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 2: <StartDispatch line 151, col 6 to line 156, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "CnfRoute"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 3: <CnfSatCandidate line 205, col 6 to line 213, col 37 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "SatWitness"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "sat"
+/\ verdict_lane = "cnf"
+/\ witness_confirmed_inproc = TRUE
+
+State 4: <SatGateSkipped line 484, col 6 to line 490, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Emit"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "sat"
+/\ verdict_lane = "cnf"
+/\ witness_confirmed_inproc = TRUE
+
+State 5: <EmitVerdict line 496, col 6 to line 501, col 75 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = TRUE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = TRUE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Done"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "sat"
+/\ verdict_lane = "cnf"
+/\ witness_confirmed_inproc = TRUE
+
+
+Statistics:
+  States found: 4308
+  Initial states: 480
+  Transitions: 3830
+  Time: 0.262s
+
+Storage:
+  Memory states: 4308
+  Disk states: 0
+  Memory reserved: 0.1 MB
+Error: Invariant violation detected
+
+================================================================
+FULL OUTPUT: bug_unsound_gpu
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/NyVerdictAdmission.tla
+Config: specs/tla/NyVerdictAdmission.bug_unsound_gpu.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: AdmissionSound
+Mode: sequential (1 worker)
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Note: memory limit auto-detected: 11059 MB (24 GB total / 2 instances × 90%)
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+Error: Invariant AdmissionSound is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Init"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 2: <StartDispatch line 151, col 6 to line 156, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "CnfRoute"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 3: <CnfFallThrough line 169, col 6 to line 174, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "CellEnum"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 4: <CellFallThrough line 222, col 6 to line 227, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "BabLoop"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 5: <BabResolveGpuRoute line 348, col 6 to line 354, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "unresolved"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "GpuDispatch"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 6: <GpuRouteGateBypassed line 396, col 6 to line 404, col 16 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "gpu_fast_f32"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "BabLoop"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "none"
+/\ verdict_lane = "none"
+/\ witness_confirmed_inproc = FALSE
+
+State 7: <BabUnsat line 408, col 6 to line 415, col 61 of module NyVerdictAdmission>
+/\ allow_unsound_gpu = FALSE
+/\ ay_binary_present = FALSE
+/\ cell_coverage_complete = FALSE
+/\ competition_mode = FALSE
+/\ drat_checked = FALSE
+/\ emitted = FALSE
+/\ f64_revalidated = FALSE
+/\ gpu_backward_used = "gpu_fast_f32"
+/\ gpu_sound_capability = FALSE
+/\ lane_degrade_logged = FALSE
+/\ mip_compiled = FALSE
+/\ ort_confirmed = FALSE
+/\ pc = "Emit"
+/\ preset_loaded = FALSE
+/\ preset_pins_scip = FALSE
+/\ preset_requires_mip = FALSE
+/\ scip_compiled = FALSE
+/\ seq_model = FALSE
+/\ sound_gate_engaged = TRUE
+/\ verdict = "unsat"
+/\ verdict_lane = "bab"
+/\ witness_confirmed_inproc = FALSE
+
+
+Statistics:
+  States found: 7397
+  Initial states: 480
+  Transitions: 8485
+  Time: 0.362s
+
+Storage:
+  Memory states: 7397
+  Disk states: 0
+  Memory reserved: 0.2 MB
+Error: Invariant violation detected
+

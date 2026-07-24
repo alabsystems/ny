@@ -1,0 +1,71 @@
+[package]
+name = "ny-api"
+description = "Stable public API facade for ny integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+propagate = ["dep:ny-build", "dep:ny-propagate", "dep:ndarray"]
+# Proof-carrying certificates (exact-rational Farkas/entailment, Clean-checkable).
+cert = ["propagate", "dep:ny-cert", "dep:serde_json"]
+# Complete verification via MIP (ay).
+complete = ["propagate", "dep:ny-mip"]
+# Everything: propagation facade + certificates + complete MIP.
+full = ["propagate", "cert", "complete"]
+
+[dependencies]
+ny-build = { path = "../ny-build", optional = true }
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+ny-propagate = { path = "../ny-propagate", optional = true }
+ny-cert = { path = "../ny-cert", optional = true }
+ny-mip = { path = "../ny-mip", optional = true }
+# Serialize Clean-canonical certificate JSON (only with the `cert` feature).
+serde_json = { workspace = true, optional = true }
+# Needed by the sound layer-aware precision path (PART D) for per-element bound
+# array manipulation; only pulled in with the `propagate` facade.
+ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils" }
+ndarray.workspace = true
+half.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[[test]]
+name = "propagate_facade_contract"
+required-features = ["propagate"]
+
+[[test]]
+name = "graph_model_handoff"
+required-features = ["propagate"]
+
+[[test]]
+name = "singing_pitch_control_handoff"
+required-features = ["propagate"]
+
+[[test]]
+name = "phoneme_feature_certificate_handoff"
+required-features = ["propagate"]
+
+[[test]]
+name = "sound_precision_acceptance"
+required-features = ["propagate"]
+
+[[test]]
+name = "lipschitz_sound"
+required-features = ["cert"]
+
+[[test]]
+name = "symmetry_invariance"
+required-features = ["propagate"]

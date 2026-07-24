@@ -1,0 +1,50 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# yolo_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - TinyYOLO object detection CNN: 31 nodes, 364KB
+# - Ops: Add, AveragePool, Conv, Flatten, Pad, Relu (NO ScatterND)
+# - 72 instances, all same model with different epsilon perturbations
+# - Previously mislabeled as ScatterND-blocked (confused with cctsdb_yolo)
+# - Reference alpha-beta-CROWN config: skip PGD, batch_size=128, share_alphas
+# - Reference uses loss_reduction_func=max and invprop (not yet supported)
+# - DAG model (residual Add connections) → dispatched as GraphNetwork
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/yolo_2023
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: skip
+
+bab:
+  batch_size: 128
+  # Phase budget overrides (#4207).
+  # Evidence: alpha-CROWN warmup (50 SPSA iterations on 31-node DAG)
+  # consumed the entire timeout with 0 domains explored.
+  # Cap warmup at 15% of total, matching cifar100/soundnessbench presets.
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    # No post-BaB PGD reserve (#2206): attack.pgd_order=skip disables PGD, and
+    # the engine takes the reserve off the BaB deadline unconditionally, so a
+    # nonzero fraction would only stop BaB early for a phase that never runs.
+    # Must be set explicitly — the engine default is 0.10. (If PGD is ever
+    # re-enabled here against the reference's skip, restore ~0.10.)
+    post_bab_pgd_fraction: 0.0
+  branching:
+    # method removed: auto-branching selects ReLU-split (graph engine) for this
+    # high-dim conv DAG — input-splitting an 8112-elem box is hopeless (0 domains),
+    # ReLU-split explores ~191 domains. candidates/reduceop still tune kfsb.
+    candidates: 10
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.3
+    iterations: 50
+  beta_crown:
+    lr_alpha: 0.05
+    lr_beta: 0.1
+    iterations: 10

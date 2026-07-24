@@ -1,0 +1,41 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# CIFAR-100 VNN-COMP 2024 benchmark config
+# Ported from alpha-beta-CROWN: complete_verifier/exp_configs/vnncomp24/cifar100.yaml
+#
+# Benchmark characteristics:
+# - Medium-sized convolutional networks
+# - ImageNet-style perturbations
+# - Benefits from aggressive batching and kFSB branching
+
+general:
+  root_path: ../../vnncomp2024_benchmarks/benchmarks/cifar100
+  csv_name: instances.csv
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 10
+
+bab:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  branching:
+    # method removed: model-class-aware auto-branching selects ReLU-split (kFSB,
+    # graph engine) for this high-dim conv net (3072-element input) — input-splitting
+    # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
+    candidates: 7
+    reduceop: max
+    # #kfsb-multi: arm the wave-batched multi-objective kFSB selector. Measured
+    # Pareto on cifar100 (9/9 instances strictly better bound trajectory, 0
+    # verdict regressions, wall never extended). Kill switch: NY_MO_KFSB=0.
+    kfsb_multi: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.2
+    iterations: 10
+  alpha_crown:
+    lr_alpha: 0.25
+    iterations: 20
+  interm_transfer: false

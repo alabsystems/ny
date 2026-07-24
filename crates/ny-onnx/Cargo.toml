@@ -1,0 +1,66 @@
+[package]
+name = "ny-onnx"
+description = "Multi-format model loading, conversion, and analysis for ny IR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["onnx-value-info", "ort", "wgpu"]
+onnx-value-info = []
+benchmarks = []
+ort = ["dep:ort"]
+wgpu = ["ny-gpu/wgpu"]
+internal-test-utils = []
+pytorch = ["dep:candle-core", "dep:zip"]
+coreml = ["dep:coreml-proto"]
+gguf = ["dep:gguf"]
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+ny-propagate = { path = "../ny-propagate" }
+ny-gpu = { path = "../ny-gpu", default-features = false }
+ny-build = { path = "../ny-build" }
+ny-load = { path = "../ny-load" }
+half.workspace = true
+ndarray.workspace = true
+prost.workspace = true
+safetensors.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ort = { workspace = true, optional = true }
+npyz.workspace = true
+candle-core = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+coreml-proto = { workspace = true, optional = true }
+# GGUF format support (for llama.cpp models)
+gguf = { workspace = true, optional = true }
+# Memory-mapped file I/O (for efficient large model loading)
+memmap2.workspace = true
+flate2 = "1.0"
+tempfile.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+bytemuck.workspace = true
+ny-test-utils = { path = "../ny-test-utils" }
+libm.workspace = true
+ntest.workspace = true
+tracing-subscriber.workspace = true

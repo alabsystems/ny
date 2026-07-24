@@ -1,0 +1,74 @@
+[package]
+name = "ny-gpu"
+description = "Accelerated bound propagation for ny (SIMD + wgpu GPU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["wgpu"]
+# Cross-platform GPU backend via WebGPU. Downstream crates can opt out by
+# disabling default features and leaving `wgpu` off.
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Enable GPU integration tests. Without this feature, GPU tests are not compiled.
+# Run with: cargo test -p ny-gpu --features gpu-tests
+gpu-tests = []
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+ny-propagate = { path = "../ny-propagate" }
+ndarray.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+
+# GPU acceleration via wgpu (cross-platform)
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+# Metal-legality CI (T2.2): translate the sound WGSL shaders to MSL under Metal's
+# exact capability set (which excludes FLOAT64) without needing Apple hardware.
+# Pinned to wgpu 29's naga so no second naga version is pulled into the graph.
+naga = { version = "29", features = ["wgsl-in", "msl-out"] }
+approx.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+ny-test-utils = { path = "../ny-test-utils" }
+ny-tensor = { path = "../ny-tensor", features = ["test-utils"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "accelerated"
+harness = false
+required-features = ["wgpu"]
+
+[[bench]]
+name = "crown_backward"
+harness = false
+required-features = ["wgpu"]
+
+[[example]]
+name = "benchmark_gpu_batched"
+required-features = ["wgpu"]
+
+[[example]]
+name = "measure_crown_backward_workloads"
+required-features = ["wgpu"]
+
+[[test]]
+name = "graph_benchmark_behavior"
+required-features = ["wgpu"]

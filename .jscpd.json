@@ -1,0 +1,23 @@
+{
+  "threshold": 5,
+  "reporters": ["json", "consoleFull"],
+  "output": ".jscpd-report",
+  "ignore": [
+    ".venv/**",
+    "tests/**",
+    "reports/**",
+    "designs/**",
+    "postmortems/**",
+    "ideas/**",
+    "node_modules/**",
+    ".git/**",
+    "__pycache__/**",
+    "*.pyc",
+    "evals/**",
+    "benchmarks/**"
+  ],
+  "format": ["python", "bash", "rust", "typescript", "javascript", "swift", "go", "c", "cpp"],
+  "minLines": 6,
+  "minTokens": 50,
+  "absolute": true
+}

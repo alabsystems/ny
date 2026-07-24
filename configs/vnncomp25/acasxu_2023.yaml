@@ -1,0 +1,86 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# acasxu_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - ACAS Xu collision avoidance: 45 networks (5x9 grid), 10 properties
+# - 186 instances with per-instance timeout of 116s
+# - Networks: 5 inputs → 6×50 ReLU → 5 outputs (300 neurons)
+# - alpha-beta-CROWN reference: bound_prop_method=crown (NOT alpha-crown),
+#   input splitting, batch_size=16384, pgd_restarts=10000, clip_input_domain
+#   alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/exp_configs/vnncomp21/acasxu.yaml
+# - CRITICAL: alpha-CROWN regresses ACAS-Xu from 99.8% to 0% verified
+#   because frozen root alpha bounds don't tighten for sub-domains (#3453).
+#   Plain CROWN is set via solver.bound_prop_method below, plus --no-alpha
+#   in benchmark_vnncomp.sh as a belt-and-suspenders safety net.
+# - ny BetaCrownConfig::acas_xu() baseline: input_split, no alpha,
+#   relaxed_clip, pgd_restarts=10000, batch_size=16384
+# - Canonical measurement: 123/186 at 30s timeout (2026-03-11).
+#   Targeted 116s rerun on prop_2 (42 timeouts) showed NO additional
+#   verifications — search frontier grows faster than domain discharge.
+#   See reports/benchmarks/acasxu_2023_prop2_116s_20260311.md.
+#   Remaining gaps: prop_2 (42 timeout), prop_1 (11 domain-budget),
+#   prop_3/4 (6 timeout), prop_5/7 (2 disjunctive), prop_6/8 (2 disjunctive).
+#   Recovery requires algorithmic improvement, not longer timeouts.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/acasxu_2023
+  csv_name: instances.csv
+
+solver:
+  bound_prop_method: crown
+  batch_size: 16384
+
+attack:
+  pgd_order: after
+  pgd_restarts: 10000
+
+bab:
+  # NOTE (#3453-adjacent, MEASURED 2026-07-08): a max_domains bump was tried here and
+  # REVERTED — an A/B on the real acasxu benchmark (all 46 prop_1 + prop_3, 116s
+  # timeout) showed NY verifies 46/46 prop_1 and all measured prop_3 at the DEFAULT
+  # 100k cap (0 gap), so raising max_domains recovered ZERO instances. The config's
+  # historical "prop_1: 11 domain-budget" note (123/186, 2026-03-11) is STALE — the
+  # domain-budget gap was already closed by later branching/bound work, as the
+  # 2026-07-08 A/B above measured directly.
+  #
+  # UPDATE (MEASURED 2026-07-10): with prop_2 now routed to the JOINT multi-objective
+  # conjunctive input-split BaB (per-domain any-row-verified semantics — the only
+  # engine that can decide prop_2, whose verifying conjunct varies across the box),
+  # the 100k cap DOES bind: 1_5/prop_2 hits "Domain limit 100000" at ~168s of BaB
+  # (52.9% of popped domains verified, depth 24, contended host). The earlier
+  # zero-gap A/B only covered prop_1 + prop_3, which verify in <<100k domains
+  # either way — prop_1/prop_3 behavior is unchanged by this bump (they never
+  # approach the cap). Memory: a queued input-split domain is ~0.5KB (5-dim box +
+  # 4 obj bounds + 4x5 linear), so 1M domains ~0.5GB.
+  max_domains: 1000000
+  # acasxu prop_2 SAT instances (e.g. 1_4) are FALSIFIABLE: the disjunctive PGD
+  # attack finds the counterexample at ~26s, but the default upfront_pgd_fraction
+  # (0.20) gives only 116s*0.20 = 23s < 26s at the VNN-COMP acasxu timeout (116s),
+  # so the attack gives up and falls over to BaB -> UNKNOWN (measured: 1_4
+  # UNKNOWN@100/116/130s with 32k-39k BaB domains, VIOLATED@220s in 26s with 0
+  # BaB domains). Give the attack a larger share so SAT counterexamples surface in
+  # time. The PGD is STOCHASTIC, so the budget must comfortably exceed the ~26s CEX:
+  # 0.30 (34.8s) was FLAKY (~75% — a full props-sweep run missed 1_4); 0.40
+  # (116*0.40 = 46.4s) is RELIABLE (1_4 VIOLATED 3/3 at both 0.40 and 0.50) and still
+  # leaves 60% for BaB (1_1 UNSAT VERIFIED even at 0.50, so no regression — acasxu
+  # UNSAT verify in <40s). Soundness-safe: a found counterexample is always valid,
+  # and more attack budget can never cause a false "verified".
+  phase_budget:
+    upfront_pgd_fraction: 0.4
+  branching:
+    method: input
+    input_split:
+      reorder_bab: true
+      # Multi-dimensional input split: split the top 2 SB dims per parent,
+      # producing up to 2^2=4 children that exactly cover the parent (BaB
+      # completeness preserved). Mirrors alpha-beta-CROWN storage_depth
+      # batch-filling, tuned empirically: depth=2 verifies acasxu prop_1
+      # (1_1/1_2/1_3) in 29/105/85 domains vs 32/234/184 at depth=1, while
+      # depth>=3 regresses and depth=5 times out (per-child screen loop
+      # over-splits at high depth). Reference: alpha-beta-CROWN storage_depth.
+      depth: 2
+  clip:
+    relaxed: true

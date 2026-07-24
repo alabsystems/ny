@@ -1,0 +1,5 @@
+schema_version,lane,subject_kind,subject_id,comparison_key,category,workload,model_path,property_path,preset_path,backend,timeout_seconds,status,actual_method,wall_seconds,domains_explored,output_width_sum,profile_artifact_path,notes
+backend_benchmark_row_v1,vnncomp_compare_backends,vnncomp_instance,cersyve::row=3::m.onnx::p.vnnlib,cersyve::row=3::m.onnx::p.vnnlib,cersyve,,m.onnx,p.vnnlib,,cpu,30,verified,,1.50,5,0.001,,
+backend_benchmark_row_v1,vnncomp_compare_backends,vnncomp_instance,cersyve::row=3::m.onnx::p.vnnlib,cersyve::row=3::m.onnx::p.vnnlib,cersyve,,m.onnx,p.vnnlib,,wgpu,30,verified,,1.20,5,0.001,,
+backend_benchmark_row_v1,vnncomp_compare_backends,vnncomp_instance,cersyve::row=4::m2.onnx::p2.vnnlib,cersyve::row=4::m2.onnx::p2.vnnlib,cersyve,,m2.onnx,p2.vnnlib,,cpu,30,verified,,2.00,8,0.002,,
+backend_benchmark_row_v1,vnncomp_compare_backends,vnncomp_instance,cersyve::row=4::m2.onnx::p2.vnnlib,cersyve::row=4::m2.onnx::p2.vnnlib,cersyve,,m2.onnx,p2.vnnlib,,wgpu,30,verified,,1.60,8,0.002,,

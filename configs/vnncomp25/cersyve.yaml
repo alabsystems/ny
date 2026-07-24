@@ -1,0 +1,93 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cersyve VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Controller safety verification (lane keep, pendulum, point mass)
+# - Small DAG networks (28 layers, 1288 params, 4 inputs → 2 outputs)
+# - 12 instances: 6 pretrain (SAT) + 6 finetune (UNSAT)
+# - STATUS: 6/12 solved — PGD finds SAT counterexamples instantly
+# - Finetune (UNSAT) instances need BaB; alpha-CROWN bounds too loose
+# - alpha-beta-CROWN reference: 12/12 in 6-8s each
+# - Reference uses crown bound prop, sb branching with input_split,
+#   clip_input_domain (complete), batch_size=500K, 10k PGD
+# - ny tuning: keep PGD at 100 restarts for current graph-PGD throughput;
+#   representative SAT rows still find counterexamples immediately while UNSAT rows
+#   avoid spending ~30s in upfront PGD before any BaB work.
+# - UNBLOCKED: #1074 (sb branching) and #523 (clip_input_domain) both CLOSED.
+#   This preset now mirrors the reference input-split SB tuning
+#   (`sb_sum=True`, `sb_coeff_thresh=1e-2`, `touch_zero_score=0.1`)
+#   and batch fill ratio (`min_batch_size_ratio=0.1` → multi-depth only
+#   when queue < 10% of batch_size, matching reference conservatism for
+#   input-split). Keeps lower ny PGD budget.
+# - Re-measured 2026-03-13: 6/12 confirmed stable. Pretrain SAT found instantly;
+#   finetune UNSAT instances exhaust 100K domains in 17-35s without verifying.
+#   Score is search-quality-limited (CROWN bounds too loose), not runtime-limited.
+#   Feature gap: reorder_bab, tighter CROWN (would need improved linear relaxations).
+# - Gap vs reference:
+#   * pgd_restarts: 10000 (reference) vs 100 (ny) — capped for graph-PGD throughput
+#   * pgd_alpha: 0.01, pgd_alpha_scale: True — now mirrored in the preset
+#   * adv_check: -1 — now configurable, disabled for cersyve (#3870)
+#   * reorder_bab: True — now implemented (#3870)
+# - Status: ENTRY READY (6/12, 50%).
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cersyve
+  csv_name: instances.csv
+
+solver:
+  # Plain CROWN per-domain bounds (winner-aligned). ny default alpha-CROWN threads
+  # FROZEN root alphas into every input-split sub-domain (#3453 acasxu pattern) —
+  # too loose for the finetune UNSAT rows: 5/6 stuck unknown at 18-40s. With
+  # plain CROWN all 6 verify in 2-30s (A/B 2026-07-03, 12/12 category solve,
+  # zero regressions). Attribution: this knob alone flips the verdicts.
+  bound_prop_method: crown
+  batch_size: 500000
+  min_batch_size_ratio: 0.1
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+  pgd_alpha: 0.01
+  pgd_alpha_scale: true
+
+bab:
+  # Winner runs uncapped; verdict-safe (cap only bounds search effort). With the
+  # crown bounds above the cap is no longer reached — kept for winner parity.
+  max_domains: 10000000
+  batch_size: 500000
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 1.0e-2
+      sb_sum: true
+      touch_zero_score: 0.1
+      reorder_bab: true
+      adv_check: -1
+      # IBP-screen each input-split sub-domain before CROWN: domains that IBP can
+      # close are discharged cheaply, tightening the BaB frontier enough to verify
+      # pendulum_finetune_con (UNSAT, ort-confirmed) — +1 sound solve, no regression.
+      ibp_enhancement: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+    clip_type: complete
+  # Phase budget overrides (#2206 Packet E).
+  # Evidence: finetune UNSAT instances spend 17-35s in BaB with 0 verified
+  # (CROWN bounds too loose). Cap warmup to give BaB maximum time.
+  # Reserve 10% for post-BaB PGD as safety net for SAT detection.
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    post_bab_pgd_fraction: 0.10
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

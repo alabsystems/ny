@@ -1,0 +1,140 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cgan_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Conditional GAN robustness verification
+# - 7 model families: nCh_1/nCh_3 × imgSz32/imgSz64, plus nonlinear_activations,
+#   transposedConvPadding, upsample, small_transformer variants
+# - Architecture: Gemm → Reshape → ConvTranspose+BN+ReLU (gen) → Conv+ReLU+BN (disc) → Gemm
+# - 5-dimensional latent input, scalar output — extremely small search space
+# - 21 instances with official per-row budgets of 900s, 1200s, or 1800s;
+#   among the five retained timeout targets, upsample prop_0 is 1200s and the
+#   other four are 900s
+# - RETAINED PROJECTION STATUS: 16/21 official rows decided (12 sat, 4 unsat)
+#   and five timeouts. The legacy CSV lacks sealed per-row run provenance; these
+#   counts are planning input, not audited solve evidence.
+# - Disjunctive properties: multi-constraint output specifications
+# - Graph model (Reshape between Gemm and ConvTranspose) — CROWN-IBP disabled
+# - alpha-beta-CROWN reference: solves all instances
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
+  csv_name: instances.csv
+
+attack:
+  pgd_order: before
+  pgd_restarts: 200
+
+bab:
+  batch_size: 64
+  # Per-node CROWN-IBP time-budget cap (#4413 lever chain, #cgan-bn11-budget):
+  # BatchNormalization_11 (28,800 dims) is memory-feasible via the auto-chunked
+  # CROWN backward (#cgan-bn11-chunk), but the default 12 s equal-share cap /
+  # 2 s floor starved it back to IBP in-pipeline ("per-node budget 1.4s < 2.0s
+  # floor ... using IBP"), leaving root spec bounds at [-1628, 673] instead of
+  # the measured [-127.9, 138.4]. The full 7-node collection measured 142.96 s
+  # (cGAN_imgSz32_nCh_1 prop_1, no deadline), so cap at 150 s; the floor stays
+  # at the 2 s default. Sound either way: a skipped node degrades to IBP; a
+  # longer budget only lets the chunked CROWN backward finish.
+  crown_ibp_per_node_cap_secs: 150
+  phase_budget:
+    # Measured (prop_1 at 900 s with the cap lever active, 2026-07-10):
+    # disjunctive PGD burned ~8 min (0.50 fraction + attack extension) before
+    # any bound work. The 2 sat cgan instances fall to PGD in <2 s, so a much
+    # smaller upfront fraction loses nothing on them (root-cause doc item 2).
+    disjunctive_pgd_fraction: 0.10
+    # Disable the adaptive attack extension (#attack-extend) for cgan: the
+    # reachable set hugs the disjunctive band thresholds, so every UNSAT
+    # instance reports a "promising" margin (measured prop_1 @300 s:
+    # best_margin=-0.002 after 3/200 restarts -> +38.5 s extension; attack
+    # burned 23% of the budget). The margin gate cannot discriminate here and
+    # the sat instances fall to PGD inside the base slice, so the extension
+    # only starves the bound phases. NY_ATTACK_EXTEND_FRAC still overrides.
+    attack_extension_fraction: 0.0
+    # The alpha warmup RE-RUNS the CROWN-IBP collection several times
+    # (reference bounds, the iteration-0 output backward, sequential-alpha
+    # re-references), each ~55-93 s for the full 8-node set (28,800-dim BN_11
+    # chunked backward 18-26 s + the disc convs), and the LAST (truncated)
+    # collection is the one whose node bounds reach the BaB loop. Measured
+    # roots on prop_1 at 900 s: fraction 0.20 -> [-1628, 673]; 0.30 ->
+    # [-2215, 1054]; 0.40 -> [-1293, 595]; 0.45 -> [-1212, 580] (best; the
+    # 4th collection completes all 8 nodes but a 5th truncated re-collection
+    # still degrades the decisive map). Realizing the measured full-collection
+    # root ([-127.9, 138.4]) in-pipeline needs the collection re-run chain
+    # deduplicated (cache/share one map across precheck + alpha warmup) —
+    # that is the next lever; no preset fraction can express it.
+    initial_bounds_fraction: 0.45
+    # Companion to the input-keyed CROWN-IBP collection cache
+    # (#cgan-collection-cache): the cache serves the FIRST COMPLETE collection
+    # to every later same-box consumer (alpha-warmup reference bounds,
+    # iteration-0 output backward, sequential-alpha re-reference), so making
+    # the PRECHECK's collection complete deduplicates the entire chain.
+    # BatchNormalization_11's chunked backward costs ~95 s alone (the 142 s
+    # full-collection probe minus ~47 s for the other 7 nodes — the "18-26 s"
+    # in the earlier comment was the per-chunk, not per-node, cost). The
+    # equal-share per-node budget divides the remaining slice by the number of
+    # remaining candidates (6 at BN_11), so BN_11's share reaches 95 s only
+    # when the slice is >= ~590 s. Measured truncations at the share wire:
+    # slice 180 s (default 0.20) -> BN_11 "took 27-30 s"; 315 s (0.35) ->
+    # 49.7 s; 405 s (0.45) -> 61.6 s — every one PerNodeDeadlineExceeded, map
+    # stuck at 7 of 8 CROWN nodes, realized root [-829, 618]. 0.75 (675 s
+    # slice) puts BN_11's share at ~110 s. The slice is an upper bound, NOT
+    # spend: the precheck returns as soon as the ~150 s collection finishes,
+    # and the collection cache then serves the complete map to the alpha
+    # warmup and BaB bootstrap (zero re-collection). The principled successor
+    # is a dim/chunk-aware per-node share. Measured complete-map root:
+    # [-127.9, 138.4] (threshold +-0.33).
+    # 0.75 -> 0.85 (2026-07-10): at 0.75 BN_11's share is ~110 s, which a
+    # thermally-throttled run measured as too tight (BN_11 needed 112 s ->
+    # PerNodeDeadlineExceeded -> collection marked incomplete -> cache never
+    # served -> THREE re-collections ate the warmup slice and BaB started
+    # from the worst map [-829, 618]). 0.85 puts the share at ~125 s. The
+    # same-key intersection merge in the collection cache (#cgan-collection-
+    # cache v2) additionally makes any re-runs monotonically tightening.
+    disjunctive_precheck_fraction: 0.85
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      # Reordered input-split BaB (bound -> filter -> split -> clip) with the
+      # batched rebound lane: 64 domains per pop instead of 1, measured 3.4x
+      # domain throughput on cGAN_imgSz32_nCh_1 (5.8 -> 19.5 domains/s).
+      # Reference: alpha-beta-CROWN acasxu.yaml (same 5-d input-split shape).
+      # step-2B measurement: reorder OFF to unmask per-domain warm alpha.
+      # step-2C (2026-07-19) was invalid as an overlay A/B because reordered
+      # grouped children carried no inherited alpha. The root/deferred seeding
+      # fix is now present, but scratchpad/cgan_step2d.csv has no immutable run
+      # manifest, exact artifact identities, input hashes, or retained logs.
+      # Keep reorder OFF until the engaged route reproduces on the current,
+      # remote-aligned artifact under the fail-closed measurement wrapper.
+      reorder_bab: false
+      alpha_iteration: 5
+      lr_alpha: 0.05
+      # Batched IBP prescreen before the CROWN rebound for child domains.
+      ibp_enhancement: true
+      # #cgan-batched-stack: domain-stack the ConvTranspose2d/Conv2d/BatchNorm
+      # CROWN backwards across the 64-domain batch (one dispatch per node
+      # instead of 64 — the per-call im2col + f64 sound recompute was 87%+9%
+      # of the 3.15 s/batch backward), and (with ibp_enhancement) intersect
+      # fresh per-subdomain IBP into each domain's intermediate-bound cache so
+      # relaxations re-anchor as boxes shrink (previously all empty-history
+      # domains shared bit-identical backward relaxations; #4210 omission).
+      # Sound: row-independent stacking + hulled boxes for the bias folds
+      # (equal-or-looser than per-domain), IBP intersect of two sound
+      # enclosures. Fail-closed to the per-domain loop on any unsupported
+      # shape/op.
+      stacked_rebound: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

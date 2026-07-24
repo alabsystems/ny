@@ -1,0 +1,53 @@
+{
+  "_author": "Andrew Yates <andrewyates.name@gmail.com>",
+  "cases": {
+    "basic_bounds": {
+      "version": "<2.0>",
+      "num_inputs": 2,
+      "num_outputs": 2,
+      "input_bounds": [
+        [-1.0, 1.0],
+        [-2.0, 2.0]
+      ],
+      "output_constraints": [
+        {"kind": "le", "lhs": 0, "rhs": 1, "rhs_const": null}
+      ],
+      "is_disjunction": false
+    },
+    "or_output": {
+      "version": "<2.0>",
+      "num_inputs": 1,
+      "num_outputs": 2,
+      "input_bounds": [
+        [0.0, 1.0]
+      ],
+      "output_constraints": [
+        {"kind": "le_const", "lhs": 0, "rhs": null, "rhs_const": 0.5},
+        {"kind": "le_const", "lhs": 1, "rhs": null, "rhs_const": 0.25}
+      ],
+      "is_disjunction": true
+    },
+    "output_lower_bound": {
+      "version": "<2.0>",
+      "num_inputs": 1,
+      "num_outputs": 1,
+      "input_bounds": [
+        [0.0, 1.0]
+      ],
+      "output_constraints": [
+        {"kind": "ge_const", "lhs": 0, "rhs": null, "rhs_const": -0.25}
+      ],
+      "is_disjunction": false
+    },
+    "arithmetic_bounds": {
+      "version": "<2.0>",
+      "num_inputs": 1,
+      "num_outputs": 1,
+      "input_bounds": [
+        [0.0, 1.0]
+      ],
+      "output_constraints": [],
+      "is_disjunction": false
+    }
+  }
+}

@@ -1,0 +1,23 @@
+# linearizenn_2024 solver parameters for local benchmark runs (no root_path).
+# Use with explicit model/property paths on CLI.
+# Part of #4406.
+
+solver:
+  batch_size: 65536
+  bound_prop_method: crown
+
+attack:
+  pgd_order: after
+  pgd_restarts: 10000
+
+bab:
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

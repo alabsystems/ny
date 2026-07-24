@@ -1,0 +1,65 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default-off cGAN occurrence-7 canary aligned with alpha-beta-CROWN's current
+# vnncomp23/cgan.yaml recipe (upstream e5c7e17, fetched 2026-07-22). It mirrors
+# cgan_2023.yaml except for six explicit treatment fields:
+#   general.device: wgpu                 (NY's GPU analogue of upstream CUDA)
+#   general.conv_mode: matrix
+#   solver.bound_prop_method: crown
+#   attack.pgd_restarts: 100
+#   input_split.sb_coeff_thresh: 1.0e-2
+#   input_split.reorder_bab: true
+#
+# NY deliberately retains batch_size=64 and stacked_rebound=true: upstream
+# starts at one domain but dynamically enlarges its CUDA batch, while NY has no
+# equivalent auto-enlarger and has measured batch-64 stacking as its faster
+# sound execution surface. Plain CROWN disables alpha authority, so the copied
+# alpha_iteration=5 is inert in this treatment.
+#
+# This file is not selected automatically. A sealed A/B must substitute it for
+# vnncomp25/cgan_2023.yaml in an isolated, provenance-bound config tree.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
+  csv_name: instances.csv
+  device: wgpu
+  conv_mode: matrix
+
+solver:
+  bound_prop_method: crown
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+
+bab:
+  batch_size: 64
+  crown_ibp_per_node_cap_secs: 150
+  phase_budget:
+    disjunctive_pgd_fraction: 0.10
+    attack_extension_fraction: 0.0
+    initial_bounds_fraction: 0.45
+    disjunctive_precheck_fraction: 0.85
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      sb_coeff_thresh: 1.0e-2
+      reorder_bab: true
+      alpha_iteration: 5
+      lr_alpha: 0.05
+      ibp_enhancement: true
+      stacked_rebound: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

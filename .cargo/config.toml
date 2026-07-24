@@ -1,0 +1,9 @@
+[net]
+git-fetch-with-cli = true
+
+# Do not source-replace internal repositories with vendored copies. Local AY
+# development happens in the sibling ~/ay checkout; publish AY, then bump the
+# exact Git revision in crates/ny-mip/Cargo.toml. Third-party source vendoring,
+# when needed, is independent of this policy. AY build provenance comes from
+# its real Git checkout; sealed builders derive the expected revision from
+# Cargo.lock and pass it explicitly.

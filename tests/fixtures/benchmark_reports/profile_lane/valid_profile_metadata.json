@@ -1,0 +1,50 @@
+{
+  "schema_version": "benchmark_report_metadata_v1",
+  "report_date": "2026-03-21",
+  "issue": 4291,
+  "title": "Issue `#4291` Metaroom Host Profile Current Report",
+  "epic": 4258,
+  "summary_lines": [
+    "The direct row-10 WGPU profile timed out after `221.70s` with `0` explored domains."
+  ],
+  "commands": [
+    {
+      "label": "Profile wrapper invocation",
+      "shell": "scripts/profile_vnncomp_row.sh --backend wgpu --timeout 210"
+    }
+  ],
+  "artifact_notes": [
+    {
+      "label": "CSV artifact",
+      "path": "reports/benchmarks/issue-4291-metaroom-host-profile_20260321_032249.csv"
+    }
+  ],
+  "divergence_notes": [
+    "No backend-only divergence observed."
+  ],
+  "profile_findings": [
+    {
+      "heading": "Early sample dominant stack families",
+      "bullets": [
+        "`try_disjunctive_sampling_attack` -> `evaluate_model`",
+        "`propagate_ibp_core`"
+      ]
+    },
+    {
+      "heading": "Late sample dominant stack families",
+      "bullets": [
+        "`compute_graph_bab_bootstrap`",
+        "`propagate_crown_to_node_core`"
+      ]
+    },
+    {
+      "heading": "Hotspot-to-issue mapping",
+      "bullets": [
+        "Late-sample bootstrap work starts with `#2237`'s remaining scratch."
+      ]
+    }
+  ],
+  "verdict_lines": [
+    "Pre-BaB warmup timeout."
+  ]
+}

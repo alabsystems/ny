@@ -1,0 +1,22 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# safenlp_2024 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - SafeNLP: NLP safety verification instances
+# - 1080 instances
+# - Reference alpha-beta-CROWN config: complete_verifier=mip, pgd_restarts=10000
+#   alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/exp_configs/vnncomp24/safenlp.yaml
+# - Previous ny score: 735/1080 (68.1%) with BaB kfsb (345 unknown)
+# - MIP route should recover most unknowns since these are small FC networks
+# - Updated: Re: #3218, Re: #2569 — match reference config for breadth
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/safenlp_2024
+  csv_name: instances.csv
+
+attack:
+  pgd_order: after
+  pgd_restarts: 10000

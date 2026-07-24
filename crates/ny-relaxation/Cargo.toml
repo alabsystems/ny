@@ -1,0 +1,29 @@
+[package]
+name = "ny-relaxation"
+description = "Scalar relaxation functions for ny neural network verification proofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+kani-proofs = []
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+libm.workspace = true
+
+[dev-dependencies]
+# Differential drift tests only (tests/drift.rs): bind these scalar mirrors to
+# the production relaxations they copy. ny-propagate does not depend on
+# ny-relaxation, so this introduces no cycle, and dev-dependencies are not
+# pulled into the proofs/kani build.
+ny-propagate = { path = "../ny-propagate" }
+ny-tensor = { path = "../ny-tensor" }
+ndarray.workspace = true

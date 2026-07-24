@@ -1,0 +1,38 @@
+[package]
+name = "ny-core"
+description = "Core types and traits for ny neural network verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+half.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# Contract attributes (`#[ensures]`/`#[requires]`). The NY-owned compatibility
+# macros are no-ops under stable rustc; under tRustc contract verification the
+# compiler owns them as first-class syntax. The dependency key remains `trust`
+# so the attribute path resolves under both toolchains.
+trust.workspace = true
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils", default-features = false }
+serde_json.workspace = true
+tempfile.workspace = true
+ntest.workspace = true
+# Exact-rational oracle for the double-double error-free transformations: the
+# only way to assert `two_sum`/`two_prod` are EXACT rather than merely close,
+# and to check a real dot product's error against the `U_DD` envelope.
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+proptest.workspace = true

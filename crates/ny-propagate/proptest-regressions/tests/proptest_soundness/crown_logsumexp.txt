@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9f20f67c6130ed9f193c97a04346eaf7b55430cff2abecd29e70bcbb4a85d2a8 # shrinks to l0 = 0.0, d0 = 0.01, l1 = 0.0, d1 = 0.01, l2 = 0.0, d2 = 0.01, cl0 = 0.0, cl1 = -1.563345, cu0 = 0.0, cu1 = -1.7472557
+cc 762dd961494105540fd5734d0374e9de74028d5dd840c0bf45f4b6b00e1ef6e3 # shrinks to lower_vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.8613524], widths = [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01], lower_coeffs = [0.0, 0.0, 0.0, 0.6490863], upper_coeffs = [0.0, 0.0, 0.0, -2.5429225], lower_bias = 0.0, upper_bias = 0.0

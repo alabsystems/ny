@@ -1,0 +1,29 @@
+[package]
+name = "ny-load"
+description = "File format loaders (SafeTensors) for ny"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-build = { path = "../ny-build" }
+half.workspace = true
+ndarray.workspace = true
+safetensors.workspace = true
+tracing.workspace = true
+flate2 = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+ntest.workspace = true
+tempfile.workspace = true

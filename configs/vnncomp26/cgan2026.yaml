@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cgan2026 VNN-COMP 2026 benchmark config
+#
+# Benchmark characteristics:
+# - Conditional-GAN robustness, 2026 variant (larger models, transformer-ish
+#   blocks): ConvTranspose2d -> BN -> ReLU (gen), Conv2d -> ReLU -> BN (disc),
+#   Linear/Reshape glue. Low-dim latent input, scalar/disjunctive output.
+# - IMPORTANT: the name `cgan2026` has NO `_20NN` suffix, so the year-stripping
+#   preset fallback does NOT map it to `cgan` — this explicit preset is REQUIRED
+#   (without it cgan2026 silently runs on auto defaults with no tuning).
+# - Templated on cgan_2023's low-dimensional attack-first policy. Its retained
+#   legacy projection records 12 sat, 4 unsat, and 5 timeout rows out of 21; it
+#   does not establish the former 15/16 PGD claim or any cgan2026 solve rate.
+#   Surviving instances fall through to input-split BaB.
+
+general:
+  root_path: ../../benchmarks/vnncomp2026/benchmarks/cgan2026/2.0
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: before
+  pgd_restarts: 200
+
+bab:
+  batch_size: 64
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

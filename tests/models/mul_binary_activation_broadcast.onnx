@@ -1,0 +1,23 @@
+	ny-onnx-fixture(:³
+
+xarelu"Relu
+
+ybsigmoid"Sigmoid
+
+a
+boutmul"Mulmul_binary_activation_broadcastZ
+x
+
+
+
+Z
+y
+
+
+
+b
+out
+
+
+
+B

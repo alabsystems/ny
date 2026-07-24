@@ -1,0 +1,18 @@
+; Unsafe property for crossing_relu.nnet (computes f(x) = |x|).
+;
+; STANDARD VNN-LIB CONVENTION: the output assert below encodes the NEGATION of
+; the safety property — the violation the verifier must rule out. The safety
+; property is "Y_0 <= 0.5 for all x in [-1, 1]"; the asserted violation is
+; Y_0 >= 0.5. Since f(x) = |x| reaches 1.0 at x = +/-1, the violation is SAT
+; (concrete counterexample at x = 1.0: y = 1.0 >= 0.5).
+; Expected verdict: violated/sat with a counterexample (`ny beta-crown`,
+; exit 1). Bound-propagation-only runs (`ny verify`) cannot falsify and
+; soundly report property_status unknown (exit 2) — never "safe".
+(declare-const X_0 Real)
+(declare-const Y_0 Real)
+
+(assert (>= X_0 -1.0))
+(assert (<= X_0 1.0))
+
+; Violation (negated safety property): the output reaches 0.5 or above.
+(assert (>= Y_0 0.5))

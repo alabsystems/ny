@@ -1,0 +1,97 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# metaroom_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Indoor navigation CNN benchmark with 100 instances
+# - Current ny full benchmark score: 83/100 (83%)
+# - GPU CROWN backward reduces 6cnn_ry from 900s+ to ~34s (#3397 closed)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/metaroom_2023
+  csv_name: instances.csv
+  device: wgpu
+
+# ATTACK BUDGET CUT (2026-07 gap probe): the official per-instance budget is
+# 210s (instances.csv col 3); reports/measured's metaroom timeouts were taken
+# at a ~60s harness budget, so several "gap" UNSAT instances already solve at
+# 210s. These properties are multi-constraint disjunctions, so they route
+# through the graph disjunctive PGD attack, whose default slice is
+# disjunctive_pgd_fraction=0.50 (up to ~100s of the 200s internal budget) with
+# default 200 restarts x 50 steps of exact-grad PGD — pure overhead on the
+# UNSAT instances. A/B probe on 4cnn_ry_57_9/spec_idx_28 @210s (same binary):
+# old config unsat in 200s (10s from the budget wall) vs this config unsat in
+# 186s — the attack cut buys back ~14s of BaB margin per instance, which is
+# the difference between scoring and timing out for verdicts this close to
+# the wall. 6cnn_ry_1_0/spec_idx_108 still times out under BOTH configs (BaB
+# throughput on 6cnn is the binding constraint, not phase budgeting).
+# Attack-only tuning: PGD can only produce candidate counterexamples (each is
+# re-validated before emission), never a verdict — soundness is untouched.
+attack:
+  pgd_order: middle
+  # ~11x less raw attack work than the 200x50 default. SAT-side control probe:
+  # spec_idx_144 / spec_idx_101 behave IDENTICALLY with the old and new config
+  # on the current binary (internal sat found in ~1s either way, then the
+  # ORT trusted-oracle gate downgrades to unknown — a pre-existing,
+  # config-independent witness-confirmation issue, not an attack-budget one).
+  pgd_restarts: 30
+  pgd_steps: 30
+
+bab:
+  batch_size: 384
+  interm_transfer: false
+  # Cap the disjunctive-attack slice at 10% of the budget (default 0.50):
+  # ~20s of a 200s internal budget is ample for 30x30 PGD, and BaB keeps
+  # ~170s+ for the deep 6cnn_ry UNSAT proofs.
+  # 2026-07 (#attack-extend): the batched exact-VJP disjunctive lane
+  # (graph_pgd_vjp_batched_disj.rs) completes the whole 30-restart budget in
+  # 0.4s (4cnn) / 3.6s (6cnn) INSIDE this cap — interleaved targeted/dynamic
+  # waves recover the GT=sat stragglers (spec_idx_129/148: timeout -> sat in
+  # 1-2s) with the near-wall UNSAT margins (spec_idx_28: unsat, 182s) intact,
+  # so this cap stays put.
+  phase_budget:
+    disjunctive_pgd_fraction: 0.10
+  branching:
+    # 2026-07 (#metaroom-relu-split-branching): BaBSR (`impact`) instead of the
+    # auto-selected kFSB for the ReLU-split BaB. Measured same-host A/B on the
+    # 6cnn_ry known-UNSAT timeout set @ official 210s: kFSB's frontier-WORST
+    # margin stalls (~0.06/split, e.g. spec_idx_108 depth-8 worst -2.75) while
+    # BaBSR's split picks tighten ~2x per level (depth-8 worst -1.41) — enough
+    # to PRUNE whole subtrees: spec_idx_124 timeout->unsat 26s, spec_idx_146
+    # timeout->unsat 18s, spec_idx_135 timeout->unsat 18s (each baseline-preset
+    # timeout at 210s the same day). No relative regression on spot checks:
+    # spec_114 unsat 17s (faster), sat-side spec_129 identical (pre-existing
+    # config-independent ORT-gate unknown), 4cnn spec_28/spec_3 timeout under
+    # BOTH configs today. Branching choice is search-only — every ReLU split is
+    # an exhaustive sign case-analysis either way; soundness untouched.
+    method: impact
+    # candidates/reduceop tune kFSB-family scoring (unused by BaBSR); kept for
+    # easy revert. See branching.rs.
+    candidates: 10
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.25
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.2
+    iterations: 50
+
+# MARGIN-ROW LANE (#epoch-bab, measured 2026-07-18)
+#
+# No per-category override needed: this category takes the SHIPPED DEFAULT
+# reserve (45s of the 200s internal tier). Historical CIFAR100 +23 bookkeeping
+# appears to have used 45s; the TinyImageNet +67 commit bodies explicitly record
+# an 82s override. Neither historical run is sealed production evidence.
+#
+# Measured here at the official 210s budget on the shipped config: the five
+# instances the internal verifier times out on (spec_idx_108/113/125/126/132)
+# all close at the ROOT in ~8-10s via the lane, every one confirmed unsat by
+# >=6 official 2025 tools, and all five GT-sat rows still return non-unsat.
+#
+# The `margin_row: { reserve_secs: N }` preset knob exists for categories that
+# need to differ from the default, guarded by
+# shipped_preset_reserves_never_threaten_a_measured_solve. No shipped preset
+# currently sets it.

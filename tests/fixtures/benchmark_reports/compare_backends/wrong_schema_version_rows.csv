@@ -1,0 +1,2 @@
+schema_version,lane,subject_kind,subject_id,comparison_key,category,workload,model_path,property_path,preset_path,backend,timeout_seconds,status,actual_method,wall_seconds,domains_explored,output_width_sum,profile_artifact_path,notes
+wrong_schema_v2,vnncomp_compare_backends,vnncomp_instance,bad-schema::row=1::m.onnx::p.vnnlib,bad-schema::row=1::m.onnx::p.vnnlib,bad_schema,,m.onnx,p.vnnlib,,cpu,30,verified,,1.00,5,,,

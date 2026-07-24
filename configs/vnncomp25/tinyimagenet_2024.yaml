@@ -1,0 +1,70 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# tinyimagenet_2024 VNN-COMP 2025 benchmark config
+# Ported from alpha-beta-CROWN: complete_verifier/exp_configs/vnncomp25/tinyimagenet.yaml
+# Renamed from tinyimagenet.yaml to match category name (#3593)
+#
+# Benchmark characteristics:
+# - Large image classification ResNets (DAG topology, residual skip connections)
+# - High-dimensional inputs (64x64x3)
+# - Benefits from aggressive batching
+# - ny: graph kFSB with child evaluation (#4300)
+# - Reference uses kfsb (alpha-beta-CROWN supports kfsb on DAG models natively)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/tinyimagenet_2024
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 10
+  pgd_restart_when_stuck: true
+
+bab:
+  batch_size: 128
+  auto_enlarge_batch_size: true
+  branching:
+    # method removed: model-class-aware auto-branching selects ReLU-split (kFSB,
+    # graph engine) for this high-dim conv net (9408-element input) — input-splitting
+    # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
+    candidates: 10
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 20
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15
+  # Phase budget overrides (#2206 Packet E).
+  # Cap warmup at 15% to prevent alpha-CROWN from consuming the entire budget
+  # on large ResNet models. Reserve 10% for post-BaB PGD fallback.
+  phase_budget:
+    # #attack-extend gate cannot discriminate on this benchmark: near-boundary
+    # (promising-margin) HOLD instances trigger the extension, which then consumes
+    # the entire remaining budget before warmup/BaB ever run (measured 2026-07-12:
+    # prop8945 with the extension = 6-line silent timeout; with 0.0 = 890 BaB
+    # domains and best margin +0.018 at the 100s budget). Same class of fix as
+    # disjunctive_pgd_max_secs below.
+    attack_extension_fraction: 0.0
+    initial_bounds_fraction: 0.15
+    # The graph gradient disjunctive PGD (graph_pgd.rs `try_graph_disjunctive_pgd_attack`)
+    # replaced the old RANDOM-SAMPLING disjunctive attack, which found nothing on these
+    # conv ResNets and was therefore cut to 0.10. Gradient PGD is productive — it finds
+    # the `sat` counterexamples (oracle-confirmed) in seconds, as α,β-CROWN does — so the
+    # budget is restored to 0.40. The unsat instances time out regardless (BaB cannot
+    # close them yet), so attack budget is "free": it can only convert timeouts into sound
+    # sat solves, never a wrong verdict.
+    #
+    # #reclaim-pgd (measured 2026-07-09 on the sibling cifar100 resnet): hold-heavy
+    # conv-ResNet, so the falsifier's slice is dead time on UNSAT instances. The
+    # disjunctive fast-path BaB re-bases on REMAINING time. Keep the 0.40 fraction
+    # (so sat instances keep their full falsification budget) and add a 30s ABSOLUTE
+    # ceiling (disjunctive_pgd_max_secs): reclaims 10s@100s / 90s@300s for BaB and
+    # fixes the large-budget hang, with zero sat-regression risk.
+    disjunctive_pgd_fraction: 0.40
+    disjunctive_pgd_max_secs: 30
+    post_bab_pgd_fraction: 0.10

@@ -1,0 +1,54 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# collins_rul_cnn_2022 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Remaining Useful Life (RUL) prediction CNN for aircraft engines
+# - 62 instances with timeouts 30-300s
+# - Simple feedforward CNN architecture (small/medium models)
+# - Mix of SAT/UNSAT instances
+# - STATUS: 100% solve rate on 15-instance sample — all solved instantly
+# - Reference uses sb branching with input_split
+#
+# NN_rul_full_window_* THROUGHPUT NOTE (bound_prop_method: crown):
+#   On the conv NN_rul_full models the α-CROWN-in-BaB path STALLS at the root:
+#   the graph multi-objective BaB burns the whole budget optimizing α (+ GCP
+#   cuts) on the conv graph and NEVER splits (Domains explored: 0-1), so any
+#   instance whose root bound is just-insufficient times out (e.g. abc-unsat
+#   robustness_4perturbations_delta20_w40, monotonicity_CI_shift*_w40).
+#   Plain CROWN makes each per-domain bound ~3-6x cheaper, so BaB actually
+#   branches (hundreds-thousands of domains) and closes the medium band while
+#   matching or beating α-CROWN on the instances it already solved
+#   (2p_delta20 82->51s, 2p_delta40 87->53s, 16p_delta5 88->53s,
+#   mono_shift5 102->64s, mono_shift10 solved 76s, 4p_delta20 timeout->61s).
+#   SOUND: plain CROWN bounds are valid; a VERIFIED verdict is still proven,
+#   and SAT is decided by the PGD/attack lane (unaffected). No wrong verdicts.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/collins_rul_cnn_2022
+  csv_name: instances.csv
+
+solver:
+  # Disable α-CROWN (use plain CROWN) so BaB splits instead of stalling at the
+  # root on the conv NN_rul_full models. See THROUGHPUT NOTE above.
+  bound_prop_method: crown
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+
+bab:
+  batch_size: 100
+  branching:
+    method: kfsb
+    candidates: 8
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

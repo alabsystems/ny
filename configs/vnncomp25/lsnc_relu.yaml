@@ -1,0 +1,64 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# lsnc_relu VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Lyapunov stability neural certificate (quadrotor, satellite, etc.)
+# - Single shared model per system (relu_quadrotor2d_state.onnx, etc.)
+# - 80 instances with 25s timeout each
+# - Disjunctive output properties (multi-constraint clauses)
+# - STATUS (2026-03-07): MulBinary CROWN + Gather CROWN working. PGD finds ~10%
+#   SAT instances (1/9 in sample). BaB runs but bounds too loose for UNSAT.
+#   Upgraded from 0% (error) to ~10% (PGD SAT) since MulBinary fix.
+# - alpha-beta-CROWN reference: 75/75 (10 SAT, 65 UNSAT)
+# - Reference uses plain CROWN (`bound_prop_method: crown`), SB-style input
+#   splitting, relaxed input clipping (`clip_input_domain` default clip type),
+#   batch_size=1M, and 10k PGD restarts.
+# - ny keeps the existing input-split SB tuning and relaxed input
+#   clipping surface (`bab.clip.relaxed: true`) while switching this preset to
+#   plain CROWN and a higher PGD budget. Fresh rerun needed to measure the
+#   current-head UNSAT impact.
+# - Gap vs reference:
+#   * pgd_restarts: 1000 — tuned down from reference 10000 to keep PGD under ~3s
+#     (reference BaB is 100x faster so 10K restarts consume proportionally less budget)
+#   * pgd_alpha: 0.01, pgd_alpha_scale: True — now mirrored in the preset
+#   * branching.method: sb (reference) vs input (ny token for the same input-split path)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/lsnc_relu
+  csv_name: instances.csv
+
+solver:
+  batch_size: 1000000
+  min_batch_size_ratio: 0.0
+  bound_prop_method: crown
+
+attack:
+  pgd_order: before
+  pgd_restarts: 1000
+  pgd_steps: 100
+  pgd_alpha: 0.01
+  pgd_alpha_scale: true
+
+bab:
+  batch_size: 1000000
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 1.0e-2
+      sb_sum: true
+      touch_zero_score: 0.1
+      reorder_bab: true
+      adv_check: -1
+      ibp_enhancement: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  phase_budget:
+    initial_bounds_fraction: 1.0
+    post_bab_pgd_fraction: 0.10

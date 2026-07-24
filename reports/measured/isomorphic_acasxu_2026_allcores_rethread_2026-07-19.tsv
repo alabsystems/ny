@@ -1,0 +1,14 @@
+id	verdict	wall_s	cert
+instance_4	unsat	60.5	True
+instance_6	unsat	46.8	True
+instance_15	unsat	45.3	True
+instance_16	unsat	53.2	True
+instance_18	timeout	105.1	True
+instance_19	unsat	71.5	True
+instance_25	timeout	105.1	True
+instance_34	timeout	105.0	True
+instance_38	timeout	105.0	True
+instance_42	unsat	52.9	True
+instance_43	timeout	105.0	True
+instance_49	unsat	60.0	True
+DONE

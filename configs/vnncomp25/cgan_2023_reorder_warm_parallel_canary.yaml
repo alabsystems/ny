@@ -1,0 +1,50 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Experimental cGAN row-7 canary. This deliberately mirrors cgan_2023.yaml
+# except for the two activation knobs under input_split:
+#   reorder_bab: true
+#   warm_parallel: true
+#
+# It is not selected by the VNN-COMP cgan_2023 category automatically. A sealed
+# A/B must copy this file over vnncomp25/cgan_2023.yaml in an isolated config
+# tree and bind that tree through NY_MEASURE_CONFIGS_DIR.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
+  csv_name: instances.csv
+
+attack:
+  pgd_order: before
+  pgd_restarts: 200
+
+bab:
+  batch_size: 64
+  crown_ibp_per_node_cap_secs: 150
+  phase_budget:
+    disjunctive_pgd_fraction: 0.10
+    attack_extension_fraction: 0.0
+    initial_bounds_fraction: 0.45
+    disjunctive_precheck_fraction: 0.85
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      reorder_bab: true
+      warm_parallel: true
+      alpha_iteration: 5
+      lr_alpha: 0.05
+      ibp_enhancement: true
+      stacked_rebound: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

@@ -1,0 +1,81 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default-off cGAN generator-prefix ReLU phase-split canary, prepared for a
+# sealed occurrence-7 measurement. This file does not select an occurrence:
+# the measurement harness must enforce NY_MEASURE_INSTANCE_INDEX=7.
+#
+# This is derived from cgan_2023_abcrown_parity_canary.yaml. Its only
+# algorithmic YAML treatment is:
+#   bab.branching.method: relu
+# and the input_split stanza is absent because input-split tuning is
+# inapplicable on the ReLU-split route. The WGPU device, matrix convolution,
+# plain CROWN, PGD-100, batch-64, phase budgets, relaxed clipping, and
+# alpha/beta settings remain identical to that parent canary.
+#
+# Generator-prefix scope is deliberately supplied outside this YAML by the
+# separately provenance-sealed environment controls:
+#   NY_BRANCH_STEM=1
+#   NY_BRANCH_STEM_K=8
+#   NY_BRANCH_STEM_NODES=Relu_6,Relu_9,Relu_12
+# At ReLU-history depths 0 through 7, the selector restricts a decision to
+# those names only while at least one named candidate is both unstable and
+# scorable. If none remains, it soundly fails open to normal selection; at
+# depth 8 and beyond, normal selection is unconditional.
+#
+# Multi-objective scorer interaction is intentional and must be attributed:
+# NY_BRANCH_STEM marks the legacy branch experiment active, so the current
+# NY_MO_SCORER_FIX path is not used even if that separate variable is set.
+# With this canary's ReLU route and no NY_BRANCH_LA treatment, both named-node
+# engagement and fail-open selection use the legacy ReLU-intercept ranking.
+# Do not add NY_MO_SCORER_FIX to this treatment without a separately reviewed
+# runtime design, provenance contract, and A/B.
+#
+# A sealed treatment must additionally set the already provenance-sealed
+# diagnostic gates:
+#   NY_BRANCH_STEM_PROBE=1
+#   NY_BRANCH_TRACE=1
+# Retain stderr proving at least one `[branch-stem] PICK` from the named set
+# and the corresponding `[branch-trace]` post-split record. Without that
+# engagement evidence, the treatment is not a qualified stem canary.
+#
+# This filename cannot be selected as the cgan_2023 category preset. A sealed
+# A/B must substitute it for vnncomp25/cgan_2023.yaml in an isolated,
+# provenance-bound config tree and capture every control above.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
+  csv_name: instances.csv
+  device: wgpu
+  conv_mode: matrix
+
+solver:
+  bound_prop_method: crown
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+
+bab:
+  batch_size: 64
+  crown_ibp_per_node_cap_secs: 150
+  phase_budget:
+    disjunctive_pgd_fraction: 0.10
+    attack_extension_fraction: 0.0
+    initial_bounds_fraction: 0.45
+    disjunctive_precheck_fraction: 0.85
+  branching:
+    method: relu
+    candidates: 5
+    reduceop: max
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

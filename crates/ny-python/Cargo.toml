@@ -1,0 +1,60 @@
+[package]
+name = "ny-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for ny neural network verification"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ny"
+crate-type = ["cdylib"]
+# Disable rustdoc for this cdylib - Python users use docstrings, not rustdoc.
+# Also avoids doc filename collision with ny-cli's `ny` binary.
+doc = false
+
+# NOTE: Rust tests work with cargo test -p ny-python (no Python needed).
+# For Python integration tests: maturin develop && pytest
+
+[dependencies]
+# Note: extension-module is NOT in default features here.
+# maturin automatically enables it when building the wheel.
+# This allows cargo test to work without Python linkage issues.
+pyo3 = { version = "0.29" }
+ny-onnx = { path = "../ny-onnx", default-features = false, features = ["onnx-value-info"] }
+ny-core = { path = "../ny-core" }
+ny-gpu = { path = "../ny-gpu", default-features = false }
+ny-propagate = { path = "../ny-propagate" }
+ny-tensor = { path = "../ny-tensor" }
+ndarray = { workspace = true }
+tracing = { workspace = true }
+
+# For numpy interop
+numpy = "0.29"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils" }
+
+[features]
+default = []
+# extension-module: Required for building Python wheel, auto-enabled by maturin.
+# Do NOT enable this manually - it prevents cargo test from linking.
+extension-module = ["pyo3/extension-module"]
+# Enable ONNX Runtime-backed diff/inference helpers.
+ort = ["ny-onnx/ort"]
+# Enable the cross-platform WebGPU backend.
+wgpu = ["ny-gpu/wgpu", "ny-onnx/wgpu"]
+# Enable PyTorch weight file loading (.pt, .pth, .bin)
+pytorch = ["ny-onnx/pytorch"]
+# Enable GGUF weight file loading (.gguf)
+gguf = ["ny-onnx/gguf"]
+# Enable CoreML weight file loading (.mlmodel, .mlpackage)
+coreml = ["ny-onnx/coreml"]

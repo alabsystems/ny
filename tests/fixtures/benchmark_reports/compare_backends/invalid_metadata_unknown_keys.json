@@ -1,0 +1,15 @@
+{
+    "schema_version": "benchmark_report_metadata_v1",
+    "report_date": "2026-03-21",
+    "issue": 4282,
+    "title": "Test",
+    "epic": 4258,
+    "summary_lines": ["test"],
+    "commands": [{"label": "cmd", "shell": "echo hi"}],
+    "artifact_notes": [{"label": "csv", "path": "test.csv"}],
+    "divergence_notes": ["none"],
+    "report_notes": [{"heading": "Notes", "bullets": ["note"]}],
+    "verdict_lines": ["pass"],
+    "speedup": 1.5,
+    "extra_field": "bad"
+}

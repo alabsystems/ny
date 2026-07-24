@@ -1,0 +1,27 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Native CUDA / cuBLAS GEMM engine for ny. Isolated in its own crate because it
+# contains the only `unsafe` FFI surface in the GPU stack (cuBLAS calls);
+# ny-core / ny-gpu keep `#![forbid(unsafe_code)]`. cudarc dynamic-loads CUDA at
+# runtime (no build-script linking), so this builds under the Trust toolchain.
+[package]
+name = "ny-cuda"
+description = "Native CUDA / cuBLAS GEMM engine for ny (NVIDIA datacenter GPUs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+# dynamic-loading => dlopen CUDA/cuBLAS at runtime (no build-script CUDA link).
+# cuda-13000 bindings (CUDA 13). cudarc < 0.19 rejects CUDA 13 at build time.
+cudarc = { version = "0.19", default-features = false, features = ["cublas", "driver", "dynamic-loading", "cuda-13000"] }
+tracing.workspace = true

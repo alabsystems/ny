@@ -1,0 +1,144 @@
+EnvLock — TY model-check receipt
+================================
+Date: 2026-07-20
+Checker: ty (tla-cli), trust-toolchain build of 2026-07-16 (~/.rustup/toolchains/trust/bin/ty)
+Binary: ty (TLA model checker)
+tla 0.10.0
+Invocation (from repo root):
+  ty check specs/tla/EnvLock.tla --config <cfg> --workers 1
+
+Artifact hashes (sha256):
+99137248e117283c50ac2250b37608b7d1381ba1ba8825358d053e7058f31f8f  specs/tla/EnvLock.tla
+9bfd46f2883890360308993c2a61237e40829b0b355e8b4016471d8bc80fae6a  specs/tla/EnvLock.cfg
+860bef5f971820b72ffe1f09484241b142e7d7f690d003b02e50df82304339fe  specs/tla/EnvLock.bug_unlocked_read.cfg
+
+SUMMARY
+-------
+clean (ReaderHoldsLock=TRUE):  PASS — exhaustive, 13 states, 1 initial, 15 transitions,
+                               invariants TypeOK LockOwnership MutualExclusion ReaderSeesDefault: NO ERRORS.
+                               (2 dead actions = exactly the buggy-variant reader actions — vacuous by design.)
+bug_unlocked_read
+(ReaderHoldsLock=FALSE):       EXPECTED FAIL — ReaderSeesDefault violated (the OLD dispatch_conv2d
+                               unlocked mid-assertion read; 4-state trace: WAcquire(w1) -> WSet(w1)
+                               [env_var=Bypass] -> RReadUnlocked [robs=Bypass at rpc=read]).
+                               LockOwnership/MutualExclusion still hold: the bug is reading OUTSIDE
+                               the critical section, not breaking the mutex.
+
+================================================================
+FULL OUTPUT: clean (EnvLock.cfg)
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/EnvLock.tla
+Config: specs/tla/EnvLock.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: TypeOK, LockOwnership, MutualExclusion, ReaderSeesDefault
+Mode: sequential (1 worker)
+
+Note: running an unoptimized debug build; for performance runs use a release build (e.g., `cargo run --release --bin ty -- check ...`).
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Fused mode: cooperative BFS + symbolic verification (CDEMC)
+
+[fused] SMT compatibility (expanded): 12/12 actions compatible
+[trust-cg] deferring pre-layout native compilation until init-state layout is available: action bytecode uses layout-sensitive state aggregate access
+POR: skipped — all 12 actions are visible to the checked invariants (ample set would always be the full enabled set; 0 reduction possible)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[fused] Symbolic coverage: 33% lanes (12/12 actions translatable) — PDR: translation failed: unsupported operator: unsupported CHC scalar membership over Union(Union(SetEnum([String("w1") @ 0..0, String("w2") @ 0..0]) @ 3450..3457, SetEnum([String("r") @ 3466..3472]) @ 3466..3475) @ 3450..3473, SetEnum([String("free") @ 3486..3492]) @ 4619..4630); k-Induction: translation failed: unsupported operator: FuncSet bound must be an integer literal (unsupported: UNION, unknown construct)
+Warning: vacuous: 2 dead action(s) (never fired): RReadUnlocked, RFinishUnlocked
+Model checking complete. No error has been found.
+
+Statistics:
+  States found: 13
+  Initial states: 1
+  Transitions: 15
+  Max queue depth: 3
+  Winner: BFS (explicit-state). Symbolic coverage: 33% lanes (12/12 actions translatable) — PDR: translation failed: unsupported operator: unsupported CHC scalar membership over Union(Union(SetEnum([String("w1") @ 0..0, String("w2") @ 0..0]) @ 3450..3457, SetEnum([String("r") @ 3466..3472]) @ 3466..3475) @ 3450..3473, SetEnum([String("free") @ 3486..3492]) @ 4619..4630); k-Induction: translation failed: unsupported operator: FuncSet bound must be an integer literal (unsupported: UNION, unknown construct)
+  Symbolic coverage: 100% (12/12 actions translatable)
+  Resolved by: BFS (explicit-state)
+
+Storage:
+  Memory states: 13
+  Disk states: 0
+  Memory reserved: 0.0 MB
+
+Time: 0.558s
+
+================================================================
+FULL OUTPUT: bug_unlocked_read (EnvLock.bug_unlocked_read.cfg)
+================================================================
+Loaded extended modules: TLC
+Model checking: specs/tla/EnvLock.tla
+Config: specs/tla/EnvLock.bug_unlocked_read.cfg
+INIT: Init
+NEXT: Next
+INVARIANTS: TypeOK, LockOwnership, MutualExclusion, ReaderSeesDefault
+Mode: sequential (1 worker)
+
+Note: running an unoptimized debug build; for performance runs use a release build (e.g., `cargo run --release --bin ty -- check ...`).
+
+
+Provenance:
+  Soundness mode: Sound
+  Search completeness: exhaustive
+
+Fused mode: cooperative BFS + symbolic verification (CDEMC)
+
+[fused] SMT compatibility (expanded): 12/12 actions compatible
+[trust-cg] deferring pre-layout native compilation until init-state layout is available: action bytecode uses layout-sensitive state aggregate access
+POR: skipped — all 12 actions are visible to the checked invariants (ample set would always be the full enabled set; 0 reduction possible)
+[flat_state] flat_state_primary=false: roundtrip_ok=true, fully_flat=true, flat_primary_safe=false, view=false, symmetry=false, flat_bfs=false, full_state_storage=false
+[trust-cg] AUTO mode: deferring native action-callout compile; interpreter runs now and the per-action native cache builds once the distinct-state count reaches 131072 (TY_TRUST_CG_LAZY_COMPILE_THRESHOLD)
+[fused] Symbolic coverage: 33% lanes (12/12 actions translatable) — PDR: translation failed: unsupported operator: unsupported CHC scalar membership over Union(Union(SetEnum([String("w1") @ 0..0, String("w2") @ 0..0]) @ 3450..3457, SetEnum([String("r") @ 3466..3472]) @ 3466..3475) @ 3450..3473, SetEnum([String("free") @ 3486..3492]) @ 4619..4630); k-Induction: translation failed: unsupported operator: FuncSet bound must be an integer literal (unsupported: UNION, unknown construct)
+Error: Invariant ReaderSeesDefault is violated.
+State 1: <Initial predicate>
+/\ env_var = "Default"
+/\ lock = "free"
+/\ robs = "none"
+/\ rpc = "idle"
+/\ rprev = "Default"
+/\ wpc = ["w1" |-> "idle", "w2" |-> "idle"]
+/\ wprev = ["w1" |-> "Default", "w2" |-> "Default"]
+
+State 2: <WAcquire line 118, col 6 to line 122, col 51 of module EnvLock>
+/\ env_var = "Default"
+/\ lock = "w1"
+/\ robs = "none"
+/\ rpc = "idle"
+/\ rprev = "Default"
+/\ wpc = ["w1" |-> "locked", "w2" |-> "idle"]
+/\ wprev = ["w1" |-> "Default", "w2" |-> "Default"]
+
+State 3: <WSet line 125, col 6 to line 129, col 41 of module EnvLock>
+/\ env_var = "Bypass"
+/\ lock = "w1"
+/\ robs = "none"
+/\ rpc = "idle"
+/\ rprev = "Default"
+/\ wpc = ["w1" |-> "bypass_set", "w2" |-> "idle"]
+/\ wprev = ["w1" |-> "Default", "w2" |-> "Default"]
+
+State 4: <RReadUnlocked line 198, col 6 to line 202, col 51 of module EnvLock>
+/\ env_var = "Bypass"
+/\ lock = "w1"
+/\ robs = "Bypass"
+/\ rpc = "read"
+/\ rprev = "Default"
+/\ wpc = ["w1" |-> "bypass_set", "w2" |-> "idle"]
+/\ wprev = ["w1" |-> "Default", "w2" |-> "Default"]
+
+
+  Symbolic coverage: 100% (12/12 actions translatable)
+  Resolved by: BFS (explicit-state)
+
+Storage:
+  Memory states: 10
+  Disk states: 0
+  Memory reserved: 0.0 MB
+
+Time: 0.557s

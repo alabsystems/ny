@@ -1,0 +1,28 @@
+[package]
+name = "ny-groundtruth"
+description = "Geometric ground-truth graphs (squared/residual polynomial form) for verifying networks against analytic geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-cert = { path = "../ny-cert" }
+ny-core = { path = "../ny-core" }
+ny-propagate = { path = "../ny-propagate" }
+ny-tensor = { path = "../ny-tensor" }
+ndarray.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

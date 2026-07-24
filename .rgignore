@@ -1,0 +1,11 @@
+# Ripgrep ignore patterns for ny
+# Andrew Yates <andrewyates.name@gmail.com>
+
+# Worker logs - searching these with rg causes exponential log growth
+
+# External/reference repositories - third-party code
+.external/
+.baseline/
+.tmp/
+tmp/
+research/repos/

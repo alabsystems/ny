@@ -1,0 +1,42 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# vggnet16_2022 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Large VGG16 ImageNet robustness benchmark (1000 outputs)
+# - 18 instances, 1200s timeout each
+# - Reference alpha-beta-CROWN config:
+#   complete_verifier/exp_configs/vnncomp22/vggnet16.yaml
+# - ny keeps the currently wired subset of that preset here:
+#   * preserve input-split branching intent
+#   * route CROWN backward through `device: wgpu`
+# - The reference also uses `loss_reduction_func: max`, but ny does not
+#   apply that preset knob yet, so it is intentionally omitted here.
+# - The local benchmark archive exposes `onnx/vgg16-7.onnx` via a symlink into
+#   `vggnet16_2023`, so this preset keeps the category runnable for future
+#   current-head probes.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/vggnet16_2022
+  csv_name: instances.csv
+  device: wgpu
+
+bab:
+  batch_size: 1
+  # Phase budget overrides (#4208).
+  # Evidence: stock wgpu 30s smoke overran deadline — all budget consumed
+  # by alpha-CROWN warmup on 1000-output VGG16 before BaB starts.
+  # Cap warmup at 15% of total, matching cifar100/soundnessbench presets.
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    # Same dispatch-bound-PGD profile as tinyimagenet/cifar100: the disjunctive PGD
+    # sampling attack defaults to 50% of the budget, which on a 150528-elem VGG16 with
+    # ~200ms+ GPU-dispatch-bound forward passes starves BaB. Cut it to 10% — sound
+    # (never a wrong verdict), frees wall-clock for BaB; post-BaB PGD still runs.
+    disjunctive_pgd_fraction: 0.10
+    # Reserve 10% for post-BaB PGD fallback (#2206).
+    post_bab_pgd_fraction: 0.10
+  # branching.method removed: auto-branching picks ReLU-split for this very-high-dim
+  # (150528-elem) conv net; input-splitting that box is hopeless.

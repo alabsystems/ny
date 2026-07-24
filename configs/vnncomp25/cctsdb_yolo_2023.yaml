@@ -1,0 +1,54 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cctsdb_yolo_2023 VNN-COMP 2025 benchmark config (Chinese traffic-sign YOLO detection)
+#
+# Benchmark characteristics:
+# - YOLO-family object-detection CNN with a ScatterND-based detection head.
+# - DAG topology (residual/Concat connections) -> dispatched as GraphNetwork.
+# - Original skip reason was "ScatterND op not supported". As of 2026-05-29 that
+#   blocker is resolved: ScatterND loads (op_map) and has EXACT CROWN backward for
+#   static-index / single-variable-operand writes, with a sound IBP fallback for
+#   dynamic indices / duplicate targets (commit 4973b6d). Where/ScatterAdd/IndexAdd
+#   gained the same exact-or-sound treatment.
+# - STATUS: RUNNABLE in the default sweep (updated 2026-07-20). SKIPPED_LIST was
+#   emptied 2026-05-30 (scripts/benchmark_vnncomp_all.sh:59-66); the category now
+#   runs under RUNTIME_LIMITED_CATEGORIES, and the track has banked 11/39 sound
+#   unsat in reports/measured-ext/cctsdb_yolo_2023.csv (extended/unofficial
+#   projection). Run with competition-tuned settings via:
+#     scripts/benchmark_vnncomp_all.sh --categories cctsdb_yolo_2023 --limit N
+#
+# Tuning mirrors the YOLO detection presets (configs/vnncomp24/yolo.yaml,
+# configs/vnncomp25/yolo_2023.yaml): skip PGD on the large model, share alphas,
+# and cap the alpha-CROWN warmup so BaB actually gets budget on the DAG head.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cctsdb_yolo_2023
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  # Detection model is large; PGD warmup dominates with little payoff (YOLO pattern).
+  pgd_order: skip
+
+bab:
+  batch_size: 128
+  # Phase budget overrides: cap warmup at 15% of total so the ScatterND-head DAG
+  # reaches graph beta-CROWN BaB instead of consuming the budget in alpha-CROWN
+  # warmup (matches cifar100/yolo_2023/soundnessbench presets).
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    post_bab_pgd_fraction: 0.10
+  branching:
+    method: kfsb
+    candidates: 7
+    reduceop: max
+  alpha_crown:
+    share_alphas: true
+    lr_alpha: 0.3
+    iterations: 50
+  beta_crown:
+    lr_alpha: 0.05
+    lr_beta: 0.1
+    iterations: 10

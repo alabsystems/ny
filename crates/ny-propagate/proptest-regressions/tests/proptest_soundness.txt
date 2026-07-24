@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bba01b4319fd953543458748cf28e637af76a38194e75bb330ac0f8d488ed55c # shrinks to (l0, u0) = (0.0, 0.0), (l1, u1) = (0.0, 0.0), (l2, u2) = (0.0, 0.0)
+cc 7ee24f0c80ed3cccdccb733feadf54dbd56562b80cb8dae6f3a5e1866e176260 # shrinks to (l0, u0) = (0.0, 0.0), (l1, u1) = (0.0, 0.0), (l2, u2) = (0.0, 0.0), (l3, u3) = (0.0, 0.0)
+cc 7546e4f326a7d0855ad75b28022f7bcc404bef421e2ba2bcb403846163637526 # shrinks to (l, u) = (-5.9896145, 0.0)
+cc 6149dfe488e8268f18e2aa0ac52c9de30356f91684ac086edc2f900a0b4e05ff # shrinks to downstream_lower = [0.0, 0.0, 0.0, 0.0], downstream_upper_offset = [0.0, 0.0, 0.13010813, 0.0], downstream_b = [0.0, 0.0], mccormick_a_a = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], mccormick_a_b = [0.0, 0.0], mccormick_b_a = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], mccormick_b_b = [0.0, 0.0], bias_val = [-0.69386905, 0.0], input_a = [0.0, 0.0, 0.0], input_b = [0.0, 0.0, 0.0]

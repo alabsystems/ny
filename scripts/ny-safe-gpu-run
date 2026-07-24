@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Run a deliberately GPU-enabled job under the host memory guard and serialize
+# it with every other NY GPU probe. This file is also installed at
+# ~/.local/bin/ny-safe-gpu-run on the qualification host.
+set -euo pipefail
+umask 077
+
+if [[ "$#" -eq 0 ]]; then
+    echo "usage: ny-safe-gpu-run COMMAND [ARG ...]" >&2
+    exit 2
+fi
+
+readonly max_vmem_limit_kib=83886080
+vmem_limit_kib="${NY_GPU_VMEM_LIMIT_KIB:-${max_vmem_limit_kib}}"
+case "${vmem_limit_kib}" in
+    ''|*[!0-9]*)
+        echo "ny-safe-gpu-run: NY_GPU_VMEM_LIMIT_KIB must be an integer" >&2
+        exit 2
+        ;;
+esac
+if [[ "${vmem_limit_kib}" =~ ^0+$ ]]; then
+    echo "ny-safe-gpu-run: NY_GPU_VMEM_LIMIT_KIB must be positive" >&2
+    exit 2
+fi
+if (( ${#vmem_limit_kib} > ${#max_vmem_limit_kib} )); then
+    echo "ny-safe-gpu-run: NY_GPU_VMEM_LIMIT_KIB must not exceed ${max_vmem_limit_kib}" >&2
+    exit 2
+fi
+vmem_limit_kib=$((10#${vmem_limit_kib}))
+if (( vmem_limit_kib > max_vmem_limit_kib )); then
+    echo "ny-safe-gpu-run: NY_GPU_VMEM_LIMIT_KIB must not exceed ${max_vmem_limit_kib}" >&2
+    exit 2
+fi
+
+# Keep enough filesystem headroom for the guarded job's final link and for the
+# desktop/session services sharing this host. Cargo can otherwise accumulate
+# hundreds of GiB across repeated private builds and fail only after doing all
+# compile work. The probe follows CARGO_TARGET_DIR when one is explicit and
+# falls back to the working directory's filesystem.
+readonly default_build_min_free_kib=33554432 # 32 GiB
+readonly max_build_min_free_kib=1073741824   # 1 TiB sanity ceiling
+build_min_free_kib="${NY_BUILD_MIN_FREE_KIB:-${default_build_min_free_kib}}"
+case "${build_min_free_kib}" in
+    ''|*[!0-9]*)
+        echo "ny-safe-gpu-run: NY_BUILD_MIN_FREE_KIB must be an integer" >&2
+        exit 2
+        ;;
+esac
+if [[ "${build_min_free_kib}" =~ ^0+$ ]]; then
+    echo "ny-safe-gpu-run: NY_BUILD_MIN_FREE_KIB must be positive" >&2
+    exit 2
+fi
+if (( ${#build_min_free_kib} > ${#max_build_min_free_kib} )); then
+    echo "ny-safe-gpu-run: NY_BUILD_MIN_FREE_KIB must not exceed ${max_build_min_free_kib}" >&2
+    exit 2
+fi
+build_min_free_kib=$((10#${build_min_free_kib}))
+if (( build_min_free_kib > max_build_min_free_kib )); then
+    echo "ny-safe-gpu-run: NY_BUILD_MIN_FREE_KIB must not exceed ${max_build_min_free_kib}" >&2
+    exit 2
+fi
+
+build_disk_path="${NY_BUILD_DISK_PATH:-${CARGO_TARGET_DIR:-${PWD}}}"
+if [[ "${build_disk_path}" != /* ]]; then
+    build_disk_path="${PWD}/${build_disk_path}"
+fi
+while [[ ! -e "${build_disk_path}" ]]; do
+    parent_path="$(dirname "${build_disk_path}")"
+    if [[ "${parent_path}" == "${build_disk_path}" ]]; then
+        echo "ny-safe-gpu-run: no existing parent for disk probe: ${build_disk_path}" >&2
+        exit 2
+    fi
+    build_disk_path="${parent_path}"
+done
+
+gpu_lock_wait_seconds="${NY_GPU_LOCK_WAIT_SECS:-3600}"
+case "${gpu_lock_wait_seconds}" in
+    ''|*[!0-9]*)
+        echo "ny-safe-gpu-run: NY_GPU_LOCK_WAIT_SECS must be an integer" >&2
+        exit 2
+        ;;
+esac
+if [[ "${gpu_lock_wait_seconds}" =~ ^0+$ ]]; then
+    echo "ny-safe-gpu-run: NY_GPU_LOCK_WAIT_SECS must be positive" >&2
+    exit 2
+fi
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ ! -d "${runtime_dir}" || ! -w "${runtime_dir}" ]]; then
+    echo "ny-safe-gpu-run: runtime directory is unavailable: ${runtime_dir}" >&2
+    exit 1
+fi
+gpu_lock_path="${NY_GPU_LOCK_PATH:-${runtime_dir}/ny-safe-gpu-run.lock}"
+if [[ "${gpu_lock_path}" != /* ]]; then
+    echo "ny-safe-gpu-run: NY_GPU_LOCK_PATH must be absolute" >&2
+    exit 2
+fi
+
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-LAZY}"
+
+# Hold the lock in this supervising shell so signal handling cannot orphan the
+# lock owner while a systemd child keeps using the GPU. Use a descriptor owned
+# by this script instead of Bash 4.1's anonymous-fd syntax: macOS still ships
+# Bash 3.2, and the guard's preflight tests must remain portable there.
+readonly gpu_lock_fd=9
+exec 9>"${gpu_lock_path}"
+if ! flock --exclusive --timeout "${gpu_lock_wait_seconds}" "${gpu_lock_fd}"; then
+    echo "ny-safe-gpu-run: timed out waiting for GPU lock: ${gpu_lock_path}" >&2
+    exit 75
+fi
+
+build_free_kib="$(LC_ALL=C df -Pk "${build_disk_path}" | awk 'END { print $4 }')"
+case "${build_free_kib}" in
+    ''|*[!0-9]*)
+        echo "ny-safe-gpu-run: could not determine free KiB for ${build_disk_path}" >&2
+        exit 1
+        ;;
+esac
+if (( build_free_kib < build_min_free_kib )); then
+    echo "ny-safe-gpu-run: refusing job with only ${build_free_kib} KiB free on ${build_disk_path}" >&2
+    echo "ny-safe-gpu-run: required reserve is ${build_min_free_kib} KiB (NY_BUILD_MIN_FREE_KIB)" >&2
+    exit 75
+fi
+
+# A transient service, unlike `systemd-run --scope`, gives this supervisor a
+# stable unit it can terminate as a control group. `--wait --pipe` preserves
+# command exit status and stdio; `--expand-environment=no` preserves literal
+# shell arguments. Exported variables are copied by name so build credentials
+# and task-specific configuration retain the same semantics as direct exec.
+unit="ny-safe-gpu-${UID}-${BASHPID}-${RANDOM}.service"
+environment_args=()
+while IFS= read -r variable; do
+    [[ "${variable}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    environment_args+=("--setenv=${variable}")
+done < <(compgen -e)
+
+runner_pid=""
+launch_started=0
+# Invoked indirectly from the signal traps below.
+# shellcheck disable=SC2329
+terminate_unit() {
+    local signal="$1"
+    local exit_status="$2"
+    trap - HUP INT TERM
+
+    # Bash can dispatch a trapped signal after starting the asynchronous
+    # systemd-run command but before executing `runner_pid=$!`. Recover that
+    # PID here so the tiny launch window cannot strand the client or service.
+    if [[ -z "${runner_pid}" && "${launch_started}" == "1" ]]; then
+        local last_background_pid=""
+        set +u
+        last_background_pid="$!"
+        set -u
+        if [[ "${last_background_pid}" =~ ^[0-9]+$ ]] \
+            && kill -0 "${last_background_pid}" 2>/dev/null; then
+            runner_pid="${last_background_pid}"
+        fi
+    fi
+
+    # Repeat during the short start race: the D-Bus request may have been sent
+    # just before this shell received its signal. KillMode=control-group makes
+    # either the graceful or forced path cover every descendant.
+    for _ in {1..50}; do
+        systemctl --user kill --kill-whom=all --signal="${signal}" "${unit}" \
+            >/dev/null 2>&1 || true
+        systemctl --user stop --no-block "${unit}" >/dev/null 2>&1 || true
+        if ! systemctl --user is-active --quiet "${unit}" \
+            && [[ -n "${runner_pid}" ]] \
+            && ! kill -0 "${runner_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.02
+    done
+
+    # `is-active` reports false while a stopped unit is still deactivating, so
+    # always issue the final cgroup-wide KILL. It is harmless once the unit has
+    # disappeared and closes the stubborn-descendant/TimeoutStopSec window.
+    systemctl --user kill --kill-whom=all --signal=KILL "${unit}" \
+        >/dev/null 2>&1 || true
+    systemctl --user stop --no-block "${unit}" >/dev/null 2>&1 || true
+    if [[ -n "${runner_pid}" ]]; then
+        kill -KILL "${runner_pid}" 2>/dev/null || true
+        wait "${runner_pid}" 2>/dev/null || true
+    fi
+    exit "${exit_status}"
+}
+
+trap 'terminate_unit HUP 129' HUP
+trap 'terminate_unit INT 130' INT
+trap 'terminate_unit TERM 143' TERM
+
+launch_started=1
+# The single quotes intentionally defer positional-parameter expansion to the
+# guarded child shell.
+# shellcheck disable=SC2016
+systemd-run --user --wait --collect --pipe --quiet --same-dir \
+    --expand-environment=no \
+    --unit="${unit}" \
+    --slice=ny-build.slice \
+    --property=OOMPolicy=kill \
+    --property=KillMode=control-group \
+    --property=TimeoutStopSec=5s \
+    "${environment_args[@]}" \
+    -- bash -c 'ulimit -v "$1"; shift; exec "$@"' ny-safe-gpu-run \
+    "${vmem_limit_kib}" "$@" &
+runner_pid=$!
+launch_started=0
+
+set +e
+wait "${runner_pid}"
+status=$?
+set -e
+trap - HUP INT TERM
+exit "${status}"

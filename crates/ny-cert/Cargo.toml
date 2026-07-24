@@ -1,0 +1,32 @@
+[package]
+name = "ny-cert"
+description = "Proof-carrying verification: exact-rational CROWN certificates checkable by Clean's external-certificate verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+# Contract attributes (`#[trust::requires/ensures]`). The NY-owned compatibility
+# macros are no-ops under stable rustc; the external Trust verifier consumes the
+# attributes as proof obligations. The dependency key remains `trust` so the
+# attribute path resolves via the extern prelude under both rustc and trustc.
+trust.workspace = true
+
+[dev-dependencies]
+ntest.workspace = true
+tempfile.workspace = true

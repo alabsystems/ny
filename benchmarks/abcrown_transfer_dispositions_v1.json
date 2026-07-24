@@ -1,0 +1,438 @@
+{
+  "schema": "ny_abcrown_transfer_dispositions_v1",
+  "source_plan": "docs/ALPHA_BETA_CROWN_PERFORMANCE_TRANSFER_PLAN_2026-07-22.md",
+  "integration_base": "904e52c5b476a1bb82a0eb97d72a293a3bff9e96",
+  "allowed_statuses": [
+    "promoted_implementation",
+    "retained_default_off",
+    "recorded_kill"
+  ],
+  "items": [
+    {
+      "id": "A1",
+      "milestone": "M1",
+      "title": "cGAN factorial canary",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Use configs/vnncomp25/cgan_2023.yaml and omit every cgan_recipe factorial arm.",
+      "rationale": "The sealed canary and one-field factorials exist, but there is no sealed solved-count win or qualifying equal-solve wall result, so the recipe remains an experiment.",
+      "evidence_paths": [
+        "benchmarks/abcrown_transfer_corpus_v1.json",
+        "configs/experiments/abcrown_transfer_factorials.yaml",
+        "configs/vnncomp25/cgan_2023_abcrown_parity_canary.yaml",
+        "tests/test_run_abcrown_transfer_factorials.py"
+      ]
+    },
+    {
+      "id": "A2",
+      "milestone": "M1",
+      "title": "CIFAR-100 and TinyImageNet preset parity",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Run the unchanged category presets with no cifar100_recipe or tinyimagenet_recipe factorial override.",
+      "rationale": "Independent parity arms are sealed and selectable, but no arm has a sealed solved-count win or the required equal-solve wall and fixed-depth evidence.",
+      "evidence_paths": [
+        "benchmarks/abcrown_transfer_corpus_v1.json",
+        "configs/experiments/abcrown_transfer_factorials.yaml",
+        "configs/vnncomp25/cifar100_2024.yaml",
+        "configs/vnncomp25/tinyimagenet_2024.yaml",
+        "tests/test_run_abcrown_transfer_factorials.py"
+      ]
+    },
+    {
+      "id": "A3",
+      "milestone": "M1",
+      "title": "VGG graph and branching recipe",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Leave model.vgg_abcrown_treatment unset and use configs/vnncomp25/vggnet16_2022.yaml.",
+      "rationale": "The scoped MaxPool rewrite and treatment policy have equivalence and gate-off coverage, but no official-budget conversion of a previously open VGG property has been sealed.",
+      "evidence_paths": [
+        "configs/experiments/abcrown_transfer_factorials.yaml",
+        "configs/vnncomp25/vggnet16_2022_abcrown_parity_canary.yaml",
+        "crates/ny-cli/src/preset/vnncomp_preset_tests.rs",
+        "crates/ny-propagate/src/network/core/graph/maxpool_relu.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/input_split/root_bounds_tests.rs"
+      ]
+    },
+    {
+      "id": "B1",
+      "milestone": "M1",
+      "title": "Skip the final unusable alpha gradient pass",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Unset NY_ALPHA_FINAL_BOUND_ONLY to execute the legacy final gradient, probe, refresh, and update path.",
+      "rationale": "The bound-only terminal pass is implemented and state-regression tested behind an exact opt-in gate, but a qualifying sealed affected-phase speedup has not been established.",
+      "evidence_paths": [
+        "configs/experiments/abcrown_transfer_factorials.yaml",
+        "crates/ny-propagate/src/network/alpha_crown_loop.rs",
+        "crates/ny-propagate/src/network/alpha_crown_loop_hook_tests.rs",
+        "crates/ny-propagate/src/network/graph_alpha/propagate_dag/mod.rs"
+      ]
+    },
+    {
+      "id": "B2",
+      "milestone": "M2",
+      "title": "CUDA-wide refold guard and fallback",
+      "status": "promoted_implementation",
+      "default_changed": false,
+      "rollback_or_fallback": "Any refold mismatch or oracle error falls back to the serial loop; NY_CUDA_WIDE=0 disables the parent CUDA-wide route.",
+      "rationale": "The serial refold oracle and fail-closed rejection handling are promoted within the already default-dark CUDA-wide parent route; this is not a global CUDA-wide promotion.",
+      "evidence_paths": [
+        "crates/ny-cuda/src/sound_crown.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/tests.rs",
+        "docs/CUDA_REFOLD_ORACLE_MEASURED_2026-07-22.md"
+      ]
+    },
+    {
+      "id": "B3",
+      "milestone": "M2",
+      "title": "Reuse the existing root-alpha fold",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Leave NY_ROOT_ALPHA_GPU unset; the existing warmup gradient path performs its reference extraction and fold.",
+      "rationale": "Cache and skeleton reuse machinery exists, but the root-alpha reuse treatment remains scoped and lacks the required median root or alpha wall result.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/network/graph_alpha/resnet_skeleton.rs",
+        "crates/ny-propagate/src/network/graph_alpha/runtime_state.rs",
+        "docs/EXTRACT_SKELETON_DESIGN.md",
+        "docs/ROOT_ALPHA_GPU_DESIGN.md"
+      ]
+    },
+    {
+      "id": "C1",
+      "milestone": "M3",
+      "title": "Sparse unstable intermediate-bound queue storage",
+      "status": "recorded_kill",
+      "default_changed": false,
+      "rollback_or_fallback": "Keep dense DomainList layer-bound storage; the standalone SparseLayerBounds representation remains non-authoritative.",
+      "rationale": "The sparse representation has local differential coverage but was not promoted into a queue family and has no qualifying queue-memory and throughput result; root sparse CROWN is a different mechanism.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/batched_domain/sparse_bounds.rs",
+        "crates/ny-propagate/src/batched_domain/tests/sparse_bounds.rs",
+        "docs/ROOT_SPARSE_INTERM_CROWN_MEASURED_2026-07-22.md",
+        "docs/ALPHA_BETA_CROWN_PERFORMANCE_TRANSFER_PLAN_2026-07-22.md"
+      ]
+    },
+    {
+      "id": "C2",
+      "milestone": "M3",
+      "title": "Packed per-domain alpha state",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Use the nested-map GraphDomainAlphaState representation and its existing DomainList round-trip path.",
+      "rationale": "The f32 packed queue preserves exact optimizer trajectories and cuts the measured alpha-heavy state estimate by 51.50%, but it lacks the required 5% queue-throughput result and therefore remains independently default-off.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/beta_crown/state/alpha/packed.rs",
+        "crates/ny-propagate/src/batched_domain/domain_list/alpha_queue.rs",
+        "crates/ny-propagate/src/batched_domain/domain_list/tests/alpha_state/packed_queue.rs",
+        "scripts/ny_measurement_provenance.py"
+      ]
+    },
+    {
+      "id": "C3",
+      "milestone": "M3",
+      "title": "Reduce DomainList copies",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Use the owned-copy TensorStorage and PooledArray path for unsupported, alias-uncertain, or small-queue cases.",
+      "rationale": "Reusable pooled storage and no-restack conversions exist, but copied-byte and queue-wall promotion gates have not been demonstrated for asynchronous or device-resident frontier variants.",
+      "evidence_paths": [
+        "crates/ny-tensor/src/pooled_array.rs",
+        "crates/ny-tensor/src/tensor_storage/mod.rs",
+        "crates/ny-propagate/src/batched_domain/picked_conversion.rs",
+        "crates/ny-propagate/src/batched_domain/domain_list/tests/pick_add/basic.rs"
+      ]
+    },
+    {
+      "id": "D1",
+      "milestone": "M4",
+      "title": "In-iteration physical pruning",
+      "status": "recorded_kill",
+      "default_changed": false,
+      "rollback_or_fallback": "Retain the dense optimization batch and logical verified-lane masking without physical gather and scatter.",
+      "rationale": "No complete physical compaction increment with full-index restoration and randomized AND/OR mapping oracles reached the campaign, so the proposed transfer is killed rather than inferred from logical masking.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/network/alpha_crown_loop.rs",
+        "crates/ny-propagate/src/network/graph_alpha/propagate_dag/mod.rs",
+        "docs/ALPHA_BETA_CROWN_PERFORMANCE_TRANSFER_PLAN_2026-07-22.md"
+      ]
+    },
+    {
+      "id": "D2",
+      "milestone": "M4",
+      "title": "Memory-aware batching across BaB routes",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Leave NY_ADAPTIVE_MICROBATCH_CONTROLLER unset; existing auto_enlarge_batch_size presets retain their legacy one-way growth and fallback behavior.",
+      "rationale": "The independently gated controller now covers graph ReLU-split and DomainList input-split with ordered reason-coded backoff, but its device budget is not a live CUDA allocator query and it lacks a qualifying hardware throughput result.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/beta_crown/engine/graph/adaptive_microbatch.rs",
+        "crates/ny-propagate/src/beta_crown/config/relu_split.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/gpu_bab/tests.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/relu_split/tests/bab_loop.rs",
+        "configs/experiments/abcrown_transfer_factorials.yaml"
+      ]
+    },
+    {
+      "id": "D3",
+      "milestone": "M4",
+      "title": "Precomputed decisions with adaptive lA retention",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Retain cached lA and recompute or validate branch decisions through the existing post-dequeue path.",
+      "rationale": "Branch decisions can already be formed from batched child tensors and cached lA survives queue operations, but no adaptive drop-versus-retain policy meets the byte, mapping, or throughput gates.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/beta_crown/engine/graph/gpu_bab/mod.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/gpu_bab/batched_gpu.rs",
+        "crates/ny-propagate/src/batched_domain/domain_list/types.rs",
+        "crates/ny-propagate/src/batched_domain/domain_list/tests/pick_add/basic.rs"
+      ]
+    },
+    {
+      "id": "E1",
+      "milestone": "M5",
+      "title": "Persistent CUDA transaction",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Leave NY_CUDA_DGEMM_TRIPLET unset and use the serial sound CUDA GEMM route.",
+      "rationale": "The triplet transaction is sound and measured behind an exact gate, but 3-to-1 synchronization is below the 80 percent target and upload, 100-wave high-water, two-row NVIDIA, and end-to-end gains are absent.",
+      "evidence_paths": [
+        "crates/ny-cuda/src/lib.rs",
+        "crates/ny-cuda/src/sound_crown.rs",
+        "docs/CUDA_DGEMM_TRIPLET_MEASURED_2026-07-22.md"
+      ]
+    },
+    {
+      "id": "E2",
+      "milestone": "M5",
+      "title": "Expanded shared-batch eligibility",
+      "status": "recorded_kill",
+      "default_changed": false,
+      "rollback_or_fallback": "Use the reason-coded serial or per-domain fallback for every excluded caller mode.",
+      "rationale": "No excluded surface met all eligibility, mapping, throughput, and solved-count gates; the pure-chain candidate was refuted and the other unsupported surfaces remain fail-closed.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/beta_crown/engine/graph/domain_batch/plan.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/per_disjunct_eval.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/batched/batched_multi.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/tests_soundness.rs"
+      ],
+      "subarms": [
+        {
+          "id": "pure_chain",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Leave NY_BAB_CHAIN_WIDE unset and use the dense serial reference route.",
+          "rationale": "The differential oracle found the wide replacement looser and measured work included a solved-row timeout regression.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/network/graph_alpha/resnet_decompose.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/tests_soundness.rs"
+          ]
+        },
+        {
+          "id": "conjunctive_multi_objective",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Keep unsupported_caller_mode routing to the sequential conjunctive evaluator.",
+          "rationale": "The batch planner deliberately excludes conjunctive mode, yielding zero target-lane shared-batch eligibility.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/engine/graph/domain_batch/plan.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/root.rs"
+          ]
+        },
+        {
+          "id": "per_disjunct_alpha",
+          "status": "retained_default_off",
+          "default_changed": false,
+          "rollback_or_fallback": "Keep optimize_disjuncts_separately false or fall back to the serial per-disjunct evaluator on any batched error.",
+          "rationale": "The opt-in packed pseudo-domain path has functional coverage but lacks mapping-trajectory, fallback-rate, throughput, and solved-count promotion evidence.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/config/beta_config.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/per_disjunct_eval.rs",
+            "crates/ny-propagate/src/beta_crown/engine/tests/from_sequential_multi_objective_4355.rs"
+          ]
+        },
+        {
+          "id": "active_cuts",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Route any nonempty active cut pool through the existing per-domain fallback.",
+          "rationale": "Shared batching requires cuts inactive; overall cuts parity tests do not demonstrate an active-cut shared-batch lane.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/engine/graph/domain_batch/plan.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/batched/batched_multi.rs",
+            "crates/ny-propagate/src/beta_crown/engine/tests/multi_objective_gpu_parity.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "F1",
+      "milestone": "M1",
+      "title": "Fixed-domain alpha-beta-CROWN diagnostic oracle",
+      "status": "promoted_implementation",
+      "default_changed": false,
+      "rollback_or_fallback": "The diagnostic is read-only; omit capture or record commands and verifier execution is unchanged.",
+      "rationale": "The immutable corpus, provenance-bound capture, canonical row schema, and comparison-ready phase and bound metrics are promoted as diagnostic infrastructure, not as a verifier treatment.",
+      "evidence_paths": [
+        "benchmarks/abcrown_transfer_corpus_v1.json",
+        "docs/ABCROWN_TRANSFER_BASELINE_M0.md",
+        "scripts/abcrown_transfer_baseline.py",
+        "tests/test_abcrown_transfer_baseline.py",
+        "docs/CIFAR100_BOUND_PARITY_ORACLE.md",
+        "scripts/cifar100_bound_parity.py",
+        "tests/test_cifar100_bound_parity.py"
+      ]
+    },
+    {
+      "id": "F2",
+      "milestone": "M6",
+      "title": "Targeted reverse-mode bound gradients",
+      "status": "promoted_implementation",
+      "default_changed": false,
+      "rollback_or_fallback": "Disable the affected wide route or use its serial and SPSA fallbacks; unsupported operators continue to use SPSA.",
+      "rationale": "Only existing fused wide beta-gradient capture is promoted; analytic SPSA replacements, independent upper differentiation, conditional derivative edges, and wide alpha do not receive promotion by association.",
+      "evidence_paths": [
+        "crates/ny-gpu/src/wgpu_device/ops/crown_backward_sound_resident.rs",
+        "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched.rs",
+        "crates/ny-propagate/src/network/graph_alpha/propagate_dag/supplements.rs",
+        "docs/BATCHED_BAB_JOINT_ALPHA_GRADIENT.md"
+      ],
+      "subarms": [
+        {
+          "id": "fused_wide_beta_capture",
+          "status": "promoted_implementation",
+          "default_changed": false,
+          "rollback_or_fallback": "Set NY_RESNET_BETA_GPU=0, NY_BAB_RESNET_BATCHED=0, or NY_BAB_RESNET_WIDE_BETA=0 to select the reference route.",
+          "rationale": "One wide backward returns sound bounds and per-ReLU beta gathers, with serial or CPU fallback and historical fixed-wall throughput gains.",
+          "evidence_paths": [
+            "crates/ny-gpu/src/wgpu_device/ops/crown_backward_sound_resident.rs",
+            "crates/ny-propagate/src/network/graph_alpha/resnet_decompose.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched.rs"
+          ]
+        },
+        {
+          "id": "analytic_replacement_of_spsa_supplements",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Preserve SPSA for MulBinary, monotone S-shaped functions, Sqrt, Reciprocal, unsupported operators, and nonfinite analytic refusal.",
+          "rationale": "The named operator supplements remain SPSA and no analytic implementation completed the finite-difference, trajectory, lower-upper, soundness, and end-to-end gates.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/network/graph_alpha/propagate_dag/supplements.rs",
+            "crates/ny-propagate/src/network/graph_alpha/spsa_tests.rs",
+            "crates/ny-propagate/src/network/graph_alpha/bounds/tests.rs"
+          ],
+          "targets": [
+            "MulBinary",
+            "Sigmoid",
+            "Tanh",
+            "Sqrt",
+            "Reciprocal"
+          ]
+        },
+        {
+          "id": "independent_upper_analytic_chain",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Retain the documented AnalyticChain lower-gradient reuse for the upper path.",
+          "rationale": "AnalyticChain still does not separate upper and lower differentiation and has no candidate oracle or performance result.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/network/alpha_crown.rs",
+            "crates/ny-propagate/src/network/graph_alpha/propagate_dag/gradients/mod.rs"
+          ]
+        },
+        {
+          "id": "residual_reshape_broadcast_edges",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Keep the existing derivative mapping; reopen only after an F1 first-divergence artifact identifies a concrete defect.",
+          "rationale": "This conditional target has no identified missing or mis-mapped edge, while existing residual fanout already has finite-difference coverage.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/network/graph_alpha/backward/true_grad_oracle_tests.rs",
+            "crates/ny-propagate/src/network/graph_alpha/propagate_dag/gradients/mod.rs",
+            "docs/ALPHA_BETA_CROWN_PERFORMANCE_TRANSFER_PLAN_2026-07-22.md"
+          ]
+        },
+        {
+          "id": "fused_wide_alpha_capture",
+          "status": "retained_default_off",
+          "default_changed": false,
+          "rollback_or_fallback": "Leave NY_BAB_RESNET_WIDE_ALPHA unset; NY_WIDE_ALPHA_CPU remains the differential reference when the experiment is enabled.",
+          "rationale": "Wide alpha has finite-difference and device-oracle evidence, but the local rule regressed and the true joint adjoint lacks fixed-budget solved-count and bound-quality promotion evidence.",
+          "evidence_paths": [
+            "crates/ny-gpu/src/wgpu_device/ops/crown_backward_sound_resident.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched.rs",
+            "crates/ny-propagate/src/network/graph_alpha/resnet_decompose.rs",
+            "docs/BATCHED_BAB_JOINT_ALPHA_GRADIENT.md"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "F3",
+      "milestone": "M7",
+      "title": "Later search-policy experiments",
+      "status": "retained_default_off",
+      "default_changed": false,
+      "rollback_or_fallback": "Use existing single-mode branching, input-space attack, and zero input-split alpha refinement outside explicitly scoped presets.",
+      "rationale": "Selective input-split alpha remains a scoped experiment; the other three search ideas have no candidate with solved-count evidence and are recorded kills for this campaign.",
+      "evidence_paths": [
+        "crates/ny-propagate/src/beta_crown/config/beta_config.rs",
+        "crates/ny-propagate/src/beta_crown/branching/heuristic.rs",
+        "crates/ny-propagate/src/beta_crown/bab_cuts/graph_cut_pool/proactive.rs",
+        "crates/ny-cli/src/commands/vnncomp.rs"
+      ],
+      "subarms": [
+        {
+          "id": "full_biccos_multi_tree",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Keep the existing default-off BICCOS-lite cut controls and ordinary BaB search.",
+          "rationale": "The repository contains proactive BICCOS-lite but no full multi-tree shallow-search state, gate, oracle, or solved-count result.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/bab_cuts/cut_pool/proactive.rs",
+            "crates/ny-propagate/src/beta_crown/bab_cuts/graph_cut_pool/proactive.rs",
+            "crates/ny-propagate/src/beta_crown/config/beta_config.rs"
+          ]
+        },
+        {
+          "id": "hybrid_input_activation_branching",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Select one existing BranchingHeuristic, including InputSplit or an activation heuristic.",
+          "rationale": "The branching enum exposes separate input and activation choices but no hybrid policy or solved-count candidate.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/branching/heuristic.rs",
+            "crates/ny-propagate/src/beta_crown/config/tests.rs"
+          ]
+        },
+        {
+          "id": "activation_space_bab_attack",
+          "status": "recorded_kill",
+          "default_changed": false,
+          "rollback_or_fallback": "Use the existing concrete input-space post-BaB DLR or APGD attack, or disable it with NY_POSTBAB_ATTACK=0.",
+          "rationale": "Current post-BaB attacks consume input-space centers and frontier boxes; no activation-space attack implementation or solved-count result exists.",
+          "evidence_paths": [
+            "crates/ny-cli/src/commands/vnncomp.rs",
+            "crates/ny-propagate/src/beta_crown/bab_frontier_export.rs",
+            "docs/BAB_FRONTIER_SEEDING_DESIGN.md"
+          ]
+        },
+        {
+          "id": "selective_input_split_alpha_refinement",
+          "status": "retained_default_off",
+          "default_changed": false,
+          "rollback_or_fallback": "Keep input_split_alpha_iteration at zero and input_split_edge_alpha false outside explicitly selected presets.",
+          "rationale": "Warm and edge-alpha refinement have soundness and gate-default tests, but benchmark evidence is mixed and does not support a global solved-count promotion.",
+          "evidence_paths": [
+            "crates/ny-propagate/src/beta_crown/config/beta_config.rs",
+            "crates/ny-propagate/src/beta_crown/config/tests.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/input_split/tests.rs",
+            "crates/ny-propagate/src/beta_crown/engine/graph/input_split/tests/warm_alpha_rebound.rs"
+          ]
+        }
+      ]
+    }
+  ]
+}

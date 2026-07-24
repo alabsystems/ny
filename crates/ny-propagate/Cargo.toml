@@ -1,0 +1,56 @@
+[package]
+name = "ny-propagate"
+description = "Bound propagation algorithms (IBP, CROWN, α-CROWN, β-CROWN)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[features]
+benchmarks = []
+kani-proofs = []
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-tensor = { path = "../ny-tensor" }
+anyhow.workspace = true
+ndarray.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libm.workspace = true
+faer.workspace = true
+rand.workspace = true
+bytemuck.workspace = true
+sha2.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+proptest.workspace = true
+ntest.workspace = true
+criterion.workspace = true
+ny-gpu = { path = "../ny-gpu" }
+ny-tensor = { path = "../ny-tensor", features = ["test-utils"] }
+ny-test-utils = { path = "../ny-test-utils" }
+# Exact-rational CROWN gold oracle for the strict A·W soundness proptest
+# (#vnncomp-aw-soundness). ny-cert has no dependency on ny-propagate, so this
+# dev-dependency introduces no cycle.
+ny-cert = { path = "../ny-cert" }
+num-bigint.workspace = true
+half.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[[bench]]
+name = "propagation"
+harness = false

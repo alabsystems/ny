@@ -1,0 +1,3 @@
+model,property,result
+crossing_relu.nnet,crossing_relu_safe,verified
+crossing_relu.nnet,crossing_relu_unsafe,violated

@@ -1,0 +1,10 @@
+# Python dependencies for ny's test and benchmark tooling.
+pytest>=7.0
+pytest-timeout>=2.0
+numpy>=1.24
+PyYAML>=6.0
+tomli>=1.1; python_version < "3.11"
+
+# Optional: torch, onnx, and onnxruntime are needed only by some benchmark and
+# export scripts under benchmarks/ and scripts/ (install as needed).
+# Building the Python bindings (crates/ny-python) requires maturin.

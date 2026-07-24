@@ -1,0 +1,32 @@
+# nn4sys solver parameters for local benchmark runs (no root_path).
+# Use with explicit model/property paths on CLI.
+# Part of #4406.
+
+solver:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  bound_prop_method: forward+crown
+
+attack:
+  pgd_order: skip
+  pgd_restarts: 10
+
+bab:
+  batch_size: 64
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 0.1
+      reorder_bab: true
+  clip:
+    relaxed: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

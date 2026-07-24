@@ -1,0 +1,41 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ny-trace-bridge"
+description = "NY-owned bridge: a serialized neural-net trace schema and translator into ny-build GraphModel, decoupling the verifier from any single ML framework's IR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ny-build = { path = "../ny-build" }
+ndarray = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Differential-translation oracle (tests/differential_translation.rs): feed the
+# same logical net through ny-onnx's ONNX intake AND this bridge's TraceOp intake
+# and require the verifier bounds to agree. ny-onnx pulls in only its core ONNX
+# path here (no ORT/wgpu) — enough for onnx_proto + load_onnx_bytes +
+# to_graph_network. ny-propagate/ny-tensor supply the GraphNetwork + BoundedTensor
+# bound-propagation surface; prost encodes the synthesized ONNX in-memory.
+# onnx-value-info only: skip ORT/wgpu (not needed to build a GraphNetwork), but
+# keep onnx-value-info — ny-onnx's own shape-inference path assumes that field
+# exists, so a bare no-default-features build of ny-onnx does not compile.
+ny-onnx = { path = "../ny-onnx", default-features = false, features = ["onnx-value-info"] }
+ny-propagate = { path = "../ny-propagate" }
+ny-tensor = { path = "../ny-tensor" }
+prost = { workspace = true }

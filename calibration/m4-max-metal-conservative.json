@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "profile_name": "m4-max-metal-conservative-2026-03-11",
+  "backend": "metal",
+  "device_info": "Apple M4 Max (40 GPU cores, ~53 TFLOPS FP32, 546 GB/s memory bandwidth)",
+  "workspace_slack_bytes": 67108864,
+  "families": {
+    "convolution": {
+      "min_effective_flops_per_ns": 2650.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 3000
+    },
+    "dense_mac": {
+      "min_effective_flops_per_ns": 5300.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 3000
+    },
+    "elementwise": {
+      "min_effective_flops_per_ns": 1000.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 2000
+    },
+    "normalization": {
+      "min_effective_flops_per_ns": 500.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 3000
+    },
+    "reduction": {
+      "min_effective_flops_per_ns": 500.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 3000
+    },
+    "shape_only": {
+      "min_effective_flops_per_ns": 100.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 1000
+    },
+    "softmax": {
+      "min_effective_flops_per_ns": 750.0,
+      "min_effective_bytes_per_ns": 200.0,
+      "launch_overhead_ns": 3000
+    }
+  }
+}

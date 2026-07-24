@@ -1,0 +1,20 @@
+[package]
+name = "ny-lint-guard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Incremental clippy gate for the ny workspace — a compiled local lint tool (no CI)."
+
+[[bin]]
+name = "ny-lint-guard"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# Intentionally dependency-free: std-only so it compiles in a second and never
+# touches Cargo.lock. It orchestrates `git` and `cargo clippy` as subprocesses.
+[dependencies]

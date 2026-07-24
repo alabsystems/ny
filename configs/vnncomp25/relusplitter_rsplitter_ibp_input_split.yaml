@@ -1,0 +1,37 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# relusplitter RSPLITTER biasfield matrix-mode input-split with IBP enhancement
+#
+# Carries matrix conv_mode into the no-cuts input-split lane and enables
+# IBP enhancement (reference: input_split.ibp_enhancement) so easy subdomains
+# are screened by forward-only IBP (~1ms) before paying for CROWN backward.
+#
+# Part of #3813, Stage 2 of the revised design.
+# Design: designs/2026-03-14-issue-3813-ibp-first-input-split-alternative.md
+#
+# Reference:
+# alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/exp_configs/vnncomp22/cifar_biasfield.yaml
+# alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/input_split/bounding.py:131-136
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
+  csv_name: instances.csv
+  conv_mode: matrix
+
+solver:
+  batch_size: 4
+  bound_prop_method: crown
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 50
+
+bab:
+  branching:
+    method: sb
+    input_split:
+      enable: true
+      sb_coeff_thresh: 2.0
+      ibp_enhancement: true

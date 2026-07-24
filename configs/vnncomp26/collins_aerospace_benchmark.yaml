@@ -1,0 +1,64 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# collins_aerospace_benchmark VNN-COMP 2026 benchmark config
+#
+# Benchmark characteristics:
+# - Collins Aerospace YOLOv5-nano object detector (LeakyReLU, 640x640 input).
+#   Single ONNX (yolov5nano_LRelu_640.onnx, ~7.5MB); 1,228,800 inputs
+#   (640*640*3), 277,200 outputs, disjunctive output spec.
+# - 6 instances, 3600s timeout each. Perturbation deltas:
+#   0.001, 0.005, 0.01, 0.02, 0.05, 0.1.
+# - ALL 6 INSTANCES ARE SAT (violated). The disjunctive output property is a
+#   bounding-box robustness check that PGD falsifies immediately at every delta.
+# - The category name has NO `_20NN` suffix, so the year-stripping preset
+#   fallback does NOT map it to a shorter base name — this explicit preset is
+#   REQUIRED (without it the category runs on bare auto defaults, which already
+#   work but are not locked in against PGD-budget regressions).
+#
+# - Reference alpha-beta-CROWN config (vnncomp23/collins_yolo_robustness.yaml)
+#   uses: solver.bound_prop_method=forward+backward, batch_size=1,
+#   pgd_order=before, pgd_restarts=10, pgd_steps=200, sb input-split branching.
+#   NOTE: input-split (`sb`) branching over a 1.2M-dim input box is hopeless and
+#   is the WRONG move for ny's engine; ny's model-class-aware auto-branching
+#   correctly avoids input-split for this huge conv net. We therefore do NOT set
+#   a branching method here — PGD-before is the entire winning strategy and BaB
+#   never needs to run.
+#
+# VERIFIED (this repo, 2026-06-15, ny release binary built with --features mip):
+#   All 6/6 instances return `sat` with a valid SMT-LIB counterexample witness,
+#   each in ~9 seconds wall-clock on CPU auto defaults (300s budget used for the
+#   probe; real budget is 3600s). Up-front PGD finds the violation on every
+#   delta including the smallest (0.001). This preset makes that behavior
+#   robust: PGD runs first, with generous restarts/steps, before any expensive
+#   bound propagation; certification (proof-carrying cert emission) is already
+#   OFF on the scored vnncomp path (competition_mode=true).
+
+general:
+  root_path: ../../benchmarks/vnncomp2026/benchmarks/collins_aerospace_benchmark/2.0
+  csv_name: instances.csv
+
+attack:
+  # PGD first: this is the entire winning strategy for this all-SAT benchmark.
+  pgd_order: before
+  # Generous restarts/steps so even the smallest-delta (0.001) instance is
+  # falsified before any bound propagation. The reference uses 10 restarts /
+  # 200 steps; ny falsifies all 6 even on auto, so 200/200 is comfortable margin.
+  pgd_restarts: 200
+  pgd_steps: 200
+  # Restart PGD when a projected step leaves the point unchanged so restarts are
+  # not wasted on stalled trajectories (cheap insurance for the 0.001 instance).
+  pgd_restart_when_stuck: true
+
+bab:
+  # batch_size matches the reference (single huge-input net; large batches would
+  # blow memory). BaB realistically never runs here because PGD falsifies first.
+  batch_size: 1
+  phase_budget:
+    # Keep the up-front PGD attack well-funded: it is the only phase that matters.
+    upfront_pgd_fraction: 0.50
+    # Cap initial bound propagation so a slow CROWN backward on the 1.2M-input
+    # net can never starve the (already-successful) PGD attack. SOUND: phase
+    # budgets only reallocate wall-clock, never change a verdict.
+    initial_bounds_fraction: 0.15

@@ -1,0 +1,14 @@
+{
+    "schema": "nvidia_vulkan_validation_manifest_v1",
+    "verdict": "blocked",
+    "blocker": "wgpu did not select Vulkan backend — check driver stack",
+    "host_info_path": "host_info.txt",
+    "measure_log_path": "measure.log",
+    "measure_csv_path": "measure.csv",
+    "vulkan_confirmed": false,
+    "adapter_line": "",
+    "compare_backends_cersyve_csv": null,
+    "compare_backends_metaroom_csv": null,
+    "reference_blocker": "blocked: Vulkan not confirmed, skipped all downstream steps",
+    "reference_cersyve_real_seconds": null
+}

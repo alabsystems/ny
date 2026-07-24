@@ -1,0 +1,50 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cora_2024 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - CORA: graph neural network (GNN) verification
+# - 180 instances with disjunctive output properties
+# - Reference alpha-beta-CROWN config:
+#   alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/exp_configs/vnncomp25/cora.yaml
+#   - batch_size=10240, auto_enlarge_batch_size, optimize_disjuncts_separately
+#   - alpha lr=0.3, 20 iters; beta lr=0.1, alpha=0.03, 5 iters
+#   - interm_transfer=False, clip_interm_domain clip_in_alpha_crown
+# - Previous ny score: 89/180 (49.4%) with batch_size=64
+# - clip_in_alpha_crown runtime wired into graph beta-CROWN (#3776)
+# - ny supports per-disjunct alpha optimization (#4355) via
+#   optimize_disjuncts_separately in the multi-objective graph beta-CROWN path
+# - Updated: Re: #3776, Re: #3218, Re: #2569
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cora_2024
+  csv_name: instances.csv
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 10
+
+bab:
+  batch_size: 10240
+  interm_transfer: false
+  branching:
+    method: kfsb
+    candidates: 10
+    reduceop: max
+  clip:
+    relaxed: true
+    interm_domain: true
+    in_alpha_crown: true
+  alpha_crown:
+    lr_alpha: 0.3
+    iterations: 20
+  beta_crown:
+    lr_alpha: 0.03
+    lr_beta: 0.1
+    iterations: 5
+    # Batched per-disjunct evaluation implemented (Packets A+B, commit f59fee457).
+    # Active disjuncts are packed into the batch dimension of a single CROWN
+    # backward call. Full A/B probe pending benchmark data availability.
+    optimize_disjuncts_separately: true

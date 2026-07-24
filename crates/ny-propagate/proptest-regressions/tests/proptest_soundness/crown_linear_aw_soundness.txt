@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1544cf4bb0bbab812400cc2dd237ebafcbb37bcdb7d19c0a5ebca5413077b026 # shrinks to net = DyadicNet { weights: [[[Rat { id: 0 }, Rat { id: 0 }], [Rat { id: 21 }, Rat { id: 0 }], [Rat { id: 5 }, Rat { id: 0 }], [Rat { id: 0 }, Rat { id: 0 }], [Rat { id: 0 }, Rat { id: 0 }], [Rat { id: 0 }, Rat { id: 0 }], [Rat { id: 0 }, Rat { id: 24 }], [Rat { id: 0 }, Rat { id: 0 }]]], biases: [[Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }]], out_weight: [Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 0 }, Rat { id: 4 }, Rat { id: 0 }], out_bias: Rat { id: 4 }, input_lower: [Rat { id: 6 }, Rat { id: 6 }], input_upper: [Rat { id: 1 }, Rat { id: 1 }] }

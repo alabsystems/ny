@@ -1,0 +1,48 @@
+# Ruff configuration - Python linter
+# https://docs.astral.sh/ruff/
+#
+# Version pinned at: 0.14.14 — this file is the pin of record. `select = ["ALL"]`
+# below is version-sensitive by construction: every ruff release adds rules to
+# ALL, which then fire on unchanged code. Install the pin (`pip install
+# ruff==0.14.14`) before linting; nothing else enforces it.
+
+# Line length for formatter and E501 (if enabled)
+# Default is 88; explicit setting prevents version drift
+line-length = 88
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "D",       # docstrings
+    "ANN",     # type annotations
+    "ERA",     # commented code
+    "T20",     # print statements
+    "FBT",     # boolean trap
+    "PLR",     # pylint refactor
+    "Q",       # quotes
+    "C901",    # complexity
+    "DTZ",     # timezone
+    "S",       # security (trusted code)
+    "INP",     # namespace
+    "FA",      # future annotations
+    "BLE",     # blind except
+    "E501",    # line length (formatter handles wrapping; see pycodestyle.max-line-length below)
+    "PTH",     # pathlib style
+    "EM",      # exception messages
+    "TRY",     # tryceratops
+    "ARG",     # unused args
+    "RUF",     # ruff specific
+    "SIM",     # simplify
+    "PLW",     # pylint warnings
+    "PERF203", # try-except in loop (acceptable for resilient file processing)
+    "SLF",     # private member access (acceptable in tests)
+    "COM812",  # trailing comma - conflicts with ruff formatter
+    "TC003",   # type checking imports - not critical
+    "B905",    # zip strict parameter - false positive for window patterns
+]
+
+# Align E501 threshold with formatter line-length
+# Even though E501 is ignored, setting this prevents format/lint flip-flop
+# if E501 is re-enabled later
+[lint.pycodestyle]
+max-line-length = 88

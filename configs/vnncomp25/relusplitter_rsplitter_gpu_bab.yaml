@@ -1,0 +1,37 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# RSPLITTER biasfield sidecar for the #3862 GPU-BaB experiment.
+# Keeps the main relusplitter preset untouched while switching to a
+# GPU-BaB-compatible branching heuristic.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
+  csv_name: instances.csv
+  conv_mode: auto
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 50
+
+bab:
+  batch_size: 4
+  branching:
+    method: babsr
+  cuts:
+    enabled: true
+    near_miss: true
+    near_miss_margin: 0.01
+    proactive: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+    interm_domain: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 20
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.01
+    iterations: 15

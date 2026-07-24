@@ -1,0 +1,9 @@
+; Author: Andrew Yates <andrewyates.name@gmail.com>
+(vnnlib-version <2.0>)
+(declare-network output_const
+    (declare-input X Real [1])
+    (declare-output Y Real [1])
+)
+(assert (>= X[0] 0.0))
+(assert (<= X[0] 1.0))
+(assert (>= Y[0] -0.25))

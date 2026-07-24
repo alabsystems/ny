@@ -1,0 +1,39 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# linearizenn_2024 GPU-BaB sidecar for #4406 DomainList promotion measurement.
+# Mirrors linearizenn_2024.yaml but forces the benchmark lane onto the
+# DomainList path via `--gpu-bab`.
+#
+# Usage:
+#   target/release/ny beta-crown <model> --property <spec> \
+#     --preset configs/vnncomp25/linearizenn_2024_gpu_bab.yaml --gpu-bab --json
+#
+# This sidecar is loaded standalone via `--preset`, so it does not inherit
+# linearizenn_2024.yaml automatically — all config values are duplicated here.
+# Part of #4406.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/linearizenn_2024
+  csv_name: instances.csv
+
+solver:
+  batch_size: 65536
+  bound_prop_method: crown
+
+attack:
+  pgd_order: after
+  pgd_restarts: 10000
+
+bab:
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

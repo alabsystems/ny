@@ -1,0 +1,25 @@
+{
+  "_author": "Andrew Yates <andrewyates.name@gmail.com>",
+  "cases": [
+    {
+      "id": "basic_bounds",
+      "path": "basic_bounds.vnnlib",
+      "expect": "supported"
+    },
+    {
+      "id": "or_output",
+      "path": "or_output.vnnlib",
+      "expect": "supported"
+    },
+    {
+      "id": "output_lower_bound",
+      "path": "output_lower_bound.vnnlib",
+      "expect": "supported"
+    },
+    {
+      "id": "arithmetic_bounds",
+      "path": "arithmetic_bounds.vnnlib",
+      "expect": "supported"
+    }
+  ]
+}

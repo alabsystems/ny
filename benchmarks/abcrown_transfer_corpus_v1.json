@@ -1,0 +1,315 @@
+{
+  "schema": "ny_abcrown_transfer_corpus_v1",
+  "name": "alpha-beta-CROWN transfer M0 corpus",
+  "description": "Fixed NY transfer diagnostics and sentinels. VNN-COMP assets live in an external benchmark checkout and are skip-safe when not materialized.",
+  "entries": [
+    {
+      "id": "cifar100-medium-1761",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "residual_dag",
+        "relu_split",
+        "cifar100"
+      ],
+      "category": "cifar100_2024",
+      "source_index": 52,
+      "model": "onnx/CIFAR100_resnet_medium.onnx",
+      "property": "vnnlib/CIFAR100_resnet_medium_prop_idx_1761_sidx_3933_eps_0.0039.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/cifar100_2024.yaml",
+      "expected": {
+        "model_sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4",
+        "property_sha256": "f2a5e14de263f19a36d06a2200197e111f3cb7467eaf0f524edb09e3253b667b"
+      }
+    },
+    {
+      "id": "cifar100-medium-2477",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "residual_dag",
+        "relu_split",
+        "cifar100",
+        "cuda_refold"
+      ],
+      "category": "cifar100_2024",
+      "source_index": 14,
+      "model": "onnx/CIFAR100_resnet_medium.onnx",
+      "property": "vnnlib/CIFAR100_resnet_medium_prop_idx_2477_sidx_388_eps_0.0039.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/cifar100_2024.yaml",
+      "expected": {
+        "model_sha256": "aba117ad0ad4abdd630c220beca70cd58825e72e7bada5dffdda10bb725cece4",
+        "property_sha256": "f7832a361605ea8187e1abd4956ff0b1e0c67bd1b426df938e31f094f5383635"
+      }
+    },
+    {
+      "id": "tinyimagenet-medium-1126",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "residual_dag",
+        "relu_split",
+        "tinyimagenet"
+      ],
+      "category": "tinyimagenet_2024",
+      "source_index": 1,
+      "model": "onnx/TinyImageNet_resnet_medium.onnx",
+      "property": "vnnlib/TinyImageNet_resnet_medium_prop_idx_1126_sidx_4974_eps_0.0039.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/tinyimagenet_2024.yaml",
+      "expected": {
+        "model_sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776",
+        "property_sha256": "9497c3bdd8ade3804cfd9fe8d415941a18049753e31eede0adbf4260cdc280c1"
+      }
+    },
+    {
+      "id": "tinyimagenet-medium-7943",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "residual_dag",
+        "relu_split",
+        "tinyimagenet"
+      ],
+      "category": "tinyimagenet_2024",
+      "source_index": 3,
+      "model": "onnx/TinyImageNet_resnet_medium.onnx",
+      "property": "vnnlib/TinyImageNet_resnet_medium_prop_idx_7943_sidx_6299_eps_0.0039.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/tinyimagenet_2024.yaml",
+      "expected": {
+        "model_sha256": "234b04b151d640f8fc859fab00729448ba533d8feb3679427cbadb94467ec776",
+        "property_sha256": "27992347f22d80750a97dd4b5c3d602732d0977c7681a70d2109e0a27c9ee466"
+      }
+    },
+    {
+      "id": "cgan-occurrence-7",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "cgan_target",
+        "input_split",
+        "convtranspose"
+      ],
+      "category": "cgan_2023",
+      "source_index": 7,
+      "model": "onnx/cGAN_imgSz32_nCh_3.onnx",
+      "property": "vnnlib/cGAN_imgSz32_nCh_3_prop_2_input_eps_0.015_output_eps_0.020.vnnlib",
+      "timeout_seconds": 900,
+      "preset": "configs/vnncomp25/cgan_2023.yaml",
+      "expected": {
+        "model_sha256": "ba3dedf10023ec6ecd90ef91c99be9ca52812306b8d10230ade3f718160df200",
+        "property_sha256": "92e6a32354d02008a2a641cd7dbd6d33bd40594a18010f91745217ab77ef4659"
+      }
+    },
+    {
+      "id": "cgan-occurrence-1-sentinel",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "cgan_sentinel",
+        "input_split",
+        "convtranspose"
+      ],
+      "category": "cgan_2023",
+      "source_index": 1,
+      "model": "onnx/cGAN_imgSz32_nCh_1.onnx",
+      "property": "vnnlib/cGAN_imgSz32_nCh_1_prop_0_input_eps_0.010_output_eps_0.015.vnnlib",
+      "timeout_seconds": 900,
+      "preset": "configs/vnncomp25/cgan_2023.yaml",
+      "expected": {
+        "model_sha256": "3a8b7a57cec0ca576ed873fe93734ce800a7b27a0b0fb707f95eb2c3db1497f0",
+        "property_sha256": "9ed547db5dd45a300e6e5e8b62439ad6f0a2268c0b27f6e654f43faea00154a8"
+      }
+    },
+    {
+      "id": "vgg16-spec1",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "vgg_target",
+        "relu_split",
+        "maxpool"
+      ],
+      "category": "vggnet16_2022",
+      "source_index": 2,
+      "model": "onnx/vgg16-7.onnx",
+      "property": "vnnlib/spec1_Scottish_deerhound.vnnlib",
+      "timeout_seconds": 1200,
+      "preset": "configs/vnncomp25/vggnet16_2022.yaml",
+      "expected": {
+        "model_sha256": "f20805a3ecccaa88647bbab4ad011ff2412a9838485ea844de0fcbce349820b9",
+        "property_sha256": "996c019f0dba8a99e15be8c4d5280db10a21e559cd16c8a64e6d9e01e3bbc15f"
+      }
+    },
+    {
+      "id": "vgg16-spec0-sentinel",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "vgg_sentinel",
+        "relu_split",
+        "maxpool"
+      ],
+      "category": "vggnet16_2022",
+      "source_index": 1,
+      "model": "onnx/vgg16-7.onnx",
+      "property": "vnnlib/spec0_suit.vnnlib",
+      "timeout_seconds": 1200,
+      "preset": "configs/vnncomp25/vggnet16_2022.yaml",
+      "expected": {
+        "model_sha256": "f20805a3ecccaa88647bbab4ad011ff2412a9838485ea844de0fcbce349820b9",
+        "property_sha256": "302347d41a67c63beac38f467b509295f32d01495b12059955c245db6451317f"
+      }
+    },
+    {
+      "id": "vit-pgd-2446",
+      "kind": "vnncomp",
+      "role": "diagnostic",
+      "tags": [
+        "vit_nonlinear_dag",
+        "input_split",
+        "softmax"
+      ],
+      "category": "vit_2023",
+      "source_index": 1,
+      "model": "onnx/pgd_2_3_16.onnx",
+      "property": "vnnlib/pgd_2_3_16_2446.vnnlib",
+      "timeout_seconds": 100,
+      "preset": "configs/vnncomp25/vit_2023.yaml",
+      "expected": {
+        "model_sha256": "246326387574617a274b6f73f7f52771df1195e03c99065ce4ad18c46b8e0984",
+        "property_sha256": "c97aa0ec74aaf13cf3bbeba0860ee1b4e0680fe8a850b1d89d8aeb1735a30cac"
+      }
+    },
+    {
+      "id": "relusplitter-cuts-row1",
+      "kind": "vnncomp",
+      "role": "fixture",
+      "tags": [
+        "cuts_active",
+        "relu_split",
+        "pure_chain"
+      ],
+      "category": "relusplitter",
+      "source_index": 1,
+      "model": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "property": "vnnlib/mnist_fc_vnncomp2022_prop_5_0.05.vnnlib",
+      "timeout_seconds": 30,
+      "preset": "configs/vnncomp25/relusplitter.yaml",
+      "expected": {
+        "model_sha256": "fb53b4745b5882be61325ec24908f9fb036010cd79c99c20bb0b75e3b359acae",
+        "property_sha256": "54c6cb99a6513c051e849d179249c8ee398a01657f3689384313757a18e3c080"
+      }
+    },
+    {
+      "id": "acasxu-prop2-conjunctive",
+      "kind": "vnncomp",
+      "role": "fixture",
+      "tags": [
+        "conjunctive_multiobjective",
+        "input_split",
+        "acas_cpu"
+      ],
+      "category": "acasxu_2023",
+      "source_index": 46,
+      "model": "onnx/ACASXU_run2a_1_1_batch_2000.onnx",
+      "property": "vnnlib/prop_2.vnnlib",
+      "timeout_seconds": 116,
+      "preset": "configs/vnncomp25/acasxu_2023.yaml",
+      "expected": {
+        "model_sha256": "843f7110bf5a8b7f0eeb9b1c548d9d558db9099328b392423d5a7444a0656dd4",
+        "property_sha256": "ad309a9574d796b1e1772681185f780a277cf2f140300b676625324c158f42a0"
+      }
+    },
+    {
+      "id": "acasxu-prop1-cpu-sentinel",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "input_split",
+        "acas_cpu"
+      ],
+      "category": "acasxu_2023",
+      "source_index": 1,
+      "model": "onnx/ACASXU_run2a_1_1_batch_2000.onnx",
+      "property": "vnnlib/prop_1.vnnlib",
+      "timeout_seconds": 116,
+      "preset": "configs/vnncomp25/acasxu_2023.yaml",
+      "expected": {
+        "model_sha256": "843f7110bf5a8b7f0eeb9b1c548d9d558db9099328b392423d5a7444a0656dd4",
+        "property_sha256": "7a9a9930711817c6cc39940f5c1d0f8c51f2ed82f38e203c4b5de03c19bd4ced"
+      }
+    },
+    {
+      "id": "soundnessbench-row18",
+      "kind": "vnncomp",
+      "role": "sentinel",
+      "tags": [
+        "soundness_regression",
+        "relu_split",
+        "convolution"
+      ],
+      "category": "soundnessbench",
+      "source_index": 18,
+      "model": "onnx/model.onnx",
+      "property": "vnnlib/model_17.vnnlib",
+      "timeout_seconds": 150,
+      "preset": "configs/vnncomp25/soundnessbench.yaml",
+      "expected": {
+        "model_sha256": "77d07e4283b3a60fe2c052d97f113e52b86149b25011c4a540adaab6596f6fbd",
+        "property_sha256": "9c7144c8f9df544d1e281a96fe1f4ce5c608aff61ba4f14a9d928cb3fb580c9e"
+      }
+    },
+    {
+      "id": "repo-pure-chain-conv",
+      "kind": "repository_pair",
+      "role": "fixture",
+      "tags": [
+        "pure_chain_conv",
+        "relu_split"
+      ],
+      "model": "tests/models/conv_relu_maxpool.onnx",
+      "property": "tests/models/conv_relu_maxpool.vnnlib",
+      "timeout_seconds": 30,
+      "command": [
+        "{binary}",
+        "beta-crown",
+        "{model}",
+        "--property",
+        "{property}",
+        "--timeout",
+        "30",
+        "--branching",
+        "relu",
+        "--json"
+      ],
+      "expected": {
+        "model_sha256": "21f85bdeb8ffbbd79a51ad9d74b49b5597f47d26abc7f5ed3d4c9f0f4fb6981b",
+        "property_sha256": "bf6ac5931843f0f8f1fc4dd259754bc671feb3e8b3a8ab9d439a1208764bfe0c"
+      }
+    },
+    {
+      "id": "repo-bab-soundness-stress",
+      "kind": "repository_test",
+      "role": "suite",
+      "tags": [
+        "soundness_regression",
+        "relu_split"
+      ],
+      "timeout_seconds": 600,
+      "artifacts": [
+        "crates/ny-propagate/src/tests/bab_soundness_stress.rs"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "ny-propagate",
+        "bab_soundness_stress"
+      ]
+    }
+  ]
+}

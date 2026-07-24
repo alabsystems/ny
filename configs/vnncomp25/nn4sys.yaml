@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# nn4sys VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - NN4Sys: neural networks for computer systems
+# - 194 instances
+# - DAG gather/slice topology requires graph input splitting on ny (#3218)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/nn4sys
+  csv_name: instances.csv
+
+solver:
+  batch_size: 256
+  auto_enlarge_batch_size: true
+  bound_prop_method: forward+crown
+
+attack:
+  pgd_order: skip
+  pgd_restarts: 10
+
+bab:
+  batch_size: 64
+  clip:
+    relaxed: true
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 0.1
+      reorder_bab: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

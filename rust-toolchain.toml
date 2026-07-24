@@ -1,0 +1,7 @@
+# Pin the toolchain so the VNN-COMP submission builds reproducibly on the
+# competition AWS image (otherwise the build relies on whatever rustc the
+# image happens to provide). Bump deliberately, in lockstep with the
+# submission `install` script.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

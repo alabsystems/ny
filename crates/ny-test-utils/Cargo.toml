@@ -1,0 +1,22 @@
+[package]
+name = "ny-test-utils"
+description = "Shared test utilities for ny workspace"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# This is a dev-only crate - not published
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["core", "tensor"]
+core = ["dep:ny-core"]
+tensor = ["dep:ny-tensor"]
+
+[dependencies]
+ny-core = { path = "../ny-core", optional = true }
+ny-tensor = { path = "../ny-tensor", optional = true }

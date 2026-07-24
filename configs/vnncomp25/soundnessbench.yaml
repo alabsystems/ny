@@ -1,0 +1,84 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# soundnessbench VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Soundness benchmark: single large feedforward model (1.74M params)
+# - 128 inputs, 384 outputs, 16 layers
+# - 50 instances, all SAT (+ 1 test_nano UNSAT), 150s timeout each
+# - Disjunctive output properties (or-and clauses)
+# - STATUS: Model loads (IBP works) but CROWN/beta-CROWN too slow on CPU
+#   for 384 output dimensions. PGD should find counterexamples for SAT
+#   instances but the alpha-CROWN setup phase dominates.
+# - alpha-beta-CROWN reference: 51/51 (50 SAT, 1 UNSAT) using GPU
+# - Reference uses auto verifier, double_fp, pgd_restarts=250,
+#   pgd_steps=1000, pgd_alpha=0.005, pgd_lr_decay=0.997
+# - GPU acceleration for 384-output CROWN (#3399 closed, #3397 closed)
+# - PGD attack tuning matched to reference (pure falsification, cannot affect
+#   soundness — every PGD counterexample is re-validated before being emitted):
+#   * pgd_alpha: 0.005 — wired via attack.pgd_alpha (BetaCrownConfig.pgd_alpha_mode)
+#   * pgd_lr_decay: 0.997 — wired via attack.pgd_lr_decay (AdamClippingParams.lr_decay)
+#   * pgd_restarts: 250, pgd_steps: 1000 — wired via attack.pgd_{restarts,steps}
+# - Remaining gaps vs reference (NOT wired into the PresetConfig loader; the
+#   underlying BetaCrownConfig fields do not exist, so they are NOT set here):
+#   * double_fp: true — CLI-flag only (--double-fp) or VerifyConfigFile
+#     solver.propagation.double_fp; the vnncomp PresetConfig loader has no field.
+#   * shrink_eps: 1e-10 — CLI-flag only (--shrink-eps), applied at f64 conversion.
+#   * complete_verifier: auto — not configured (reference uses auto MIP fallback)
+#   * reset_seed_after_precompile: True — no config field anywhere in ny
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/soundnessbench
+  csv_name: instances.csv
+  device: wgpu
+
+# Note: double_fp requires --double-fp CLI flag; solver.propagation is not
+# parsed by the PresetConfig loader (only VerifyConfigFile supports it).
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 250
+  pgd_steps: 1000
+  pgd_restart_when_stuck: true
+  # PGD step size and lr decay matched to the alpha-beta-CROWN reference.
+  # Pure attack tuning: counterexamples are re-validated before emission.
+  pgd_alpha: 0.005
+  pgd_lr_decay: 0.997
+
+bab:
+  batch_size: 32
+  branching:
+    method: kfsb
+    candidates: 5
+    reduceop: max
+  clip:
+    relaxed: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 10
+  # Phase budget overrides (#2206 Packet E).
+  # Evidence: alpha-CROWN warmup dominates the 150s budget (100 iterations at
+  # 384 outputs), leaving zero time for BaB. Cap warmup at 15% of total.
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    # Give the upfront PGD attack 85% of the budget: on this benchmark the
+    # attack IS the only scoring path (all 50 instances are SAT with hidden
+    # counterexamples; chasing unsat scores -150 for wrong verdicts).
+    # Probe evidence for starving the other phases:
+    # - BaB alpha optimization is a no-op on this graph shape:
+    #   'gradient length 0 != alpha length 12288' — the split refinement
+    #   cannot improve bounds, so BaB time is wasted time.
+    # - MIP bails: the Conv2d (64x64x64) unfold needs 4.8GB > the 256M
+    #   encoding cap, so the MIP fallback never engages.
+    # - The alpha-beta-CROWN reference needs 30-125s of pure attack
+    #   (250 restarts x 1000 steps, joint margin) to land the hidden CEs.
+    upfront_pgd_fraction: 0.85
+    # Reserve 10% of total timeout for post-BaB PGD. All 50 instances are SAT;
+    # PGD needs guaranteed time even when BaB runs to its limit (#2206).
+    post_bab_pgd_fraction: 0.10

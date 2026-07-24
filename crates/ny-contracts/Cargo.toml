@@ -1,0 +1,17 @@
+[package]
+name = "ny-contracts"
+description = "NY-owned stable-Rust compatibility attributes for contract-annotated source"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "trust"
+proc-macro = true

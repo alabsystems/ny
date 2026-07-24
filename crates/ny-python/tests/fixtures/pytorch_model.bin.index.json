@@ -1,0 +1,1 @@
+{"metadata": {"total_size": 0}, "weight_map": {"model.layer1.weight": "pytorch_model-00001-of-00002.bin", "model.layer1.bias": "pytorch_model-00001-of-00002.bin", "model.layer2.weight": "pytorch_model-00002-of-00002.bin", "model.layer2.bias": "pytorch_model-00002-of-00002.bin"}}

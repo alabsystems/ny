@@ -1,0 +1,83 @@
+{
+  "suite": "gpu_crown_backward",
+  "description": "Performance regression checks for representative GPU CROWN benchmark workloads from measure_crown_backward_workloads.",
+  "checks": [
+    {
+      "name": "acasxu_cpu_production",
+      "case": "acasxu_like",
+      "phase": "cpu_production",
+      "expected_status": "measured",
+      "expected_parameter_count": 13305,
+      "expected_estimated_cpu_peak_bytes": 40000,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "baseline_seconds": 0.000642,
+      "max_regression_ratio": 10.0,
+      "max_seconds": 0.05,
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv"
+    },
+    {
+      "name": "soundnessbench_cpu_budget_guard",
+      "case": "soundnessbench_exact_like",
+      "phase": "cpu_production",
+      "expected_status": "skipped",
+      "expected_parameter_count": 1740696,
+      "expected_estimated_cpu_peak_bytes": 154618822656,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "expected_detail_substring": "dense_peak_exceeds_budget",
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv"
+    },
+    {
+      "name": "soundnessbench_graph_engine",
+      "case": "soundnessbench_exact_like",
+      "phase": "graph_crown_ibp_collection_engine",
+      "expected_status": "measured",
+      "expected_parameter_count": 1740696,
+      "expected_estimated_cpu_peak_bytes": 154618822656,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "baseline_seconds": 14.900598,
+      "max_regression_ratio": 1.6,
+      "max_seconds": 20.0,
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv"
+    },
+    {
+      "name": "soundnessbench_wgpu_warm",
+      "case": "soundnessbench_exact_like",
+      "phase": "wgpu_production_warm",
+      "expected_status": "measured",
+      "expected_parameter_count": 1740696,
+      "expected_estimated_cpu_peak_bytes": 154618822656,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "baseline_seconds": 16.602116,
+      "max_regression_ratio": 1.6,
+      "max_seconds": 20.0,
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv"
+    },
+    {
+      "name": "metaroom_graph_engine",
+      "case": "metaroom_6cnn_ry_like",
+      "phase": "graph_crown_ibp_collection_engine",
+      "expected_status": "measured",
+      "expected_parameter_count": 7410996,
+      "expected_estimated_cpu_peak_bytes": 52613349376,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "baseline_seconds": 3.895002,
+      "max_regression_ratio": 1.6,
+      "max_seconds": 15.0,
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv"
+    },
+    {
+      "name": "metaroom_wgpu_warm",
+      "case": "metaroom_6cnn_ry_like",
+      "phase": "wgpu_production_warm",
+      "expected_status": "measured",
+      "expected_parameter_count": 7410996,
+      "expected_estimated_cpu_peak_bytes": 52613349376,
+      "expected_cpu_dense_budget_bytes": 2147483648,
+      "baseline_seconds": 30.073128,
+      "max_regression_ratio": 1.5,
+      "max_seconds": 45.0,
+      "source_artifact": "reports/benchmarks/gpu_crown_backward_engine_only_20260319.csv",
+      "variance_note": "Raised from 1.3x to 1.5x: Criterion data (Mar 9-11) shows 15.8% CV for wgpu metaroom — 1.3x is within 2σ of noise (#3925)"
+    }
+  ]
+}

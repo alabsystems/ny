@@ -1,0 +1,63 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# lsnc_relu GPU-BaB sidecar for #3870 measurement runs.
+# Keeps the main preset untouched while forcing the benchmark lane onto the
+# DomainList path via `--gpu-bab`.
+#
+# NOTE: device: wgpu is intentionally NOT set here. For small models like
+# lsnc_relu (6 inputs, 2 outputs), WGPU kernel dispatch overhead (~1-5ms)
+# dominates the sub-millisecond CPU CROWN backward pass cost, causing a 300x
+# throughput regression. The GPU engine is only beneficial for large models
+# where matmul cost exceeds kernel dispatch overhead. Part of #3870.
+#
+# NOTE: max_domains raised to 10M (reference uses infinity). With default
+# 100K and 13 disjunctive clauses, only 3 clauses fit in 25s budget.
+# The remaining gap is per-domain throughput: ny achieves ~10K domains/s
+# (loop-batched CROWN) vs reference ~100K+ domains/s (tensor-batched CROWN).
+# True tensor-batched CROWN is the Phase 2 target for closing the 0/65 gap.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/lsnc_relu
+  csv_name: instances.csv
+
+solver:
+  batch_size: 1000000
+  min_batch_size_ratio: 0.0
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+
+bab:
+  batch_size: 1000000
+  max_domains: 10000000
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 1.0e-2
+      sb_sum: true
+      touch_zero_score: 0.1
+      reorder_bab: true
+      adv_check: -1
+      ibp_enhancement: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  # Keep phase-budget tuning in sync with the canonical preset (#4283).
+  # This sidecar is loaded standalone via `--preset`, so it does not inherit
+  # `lsnc_relu.yaml` automatically. No warmup cap — see lsnc_relu.yaml.
+  phase_budget:
+    initial_bounds_fraction: 1.0
+    post_bab_pgd_fraction: 0.10
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

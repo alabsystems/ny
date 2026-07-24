@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# relusplitter base cifar_biasfield input-split pilot preset
+#
+# Targets only the base biasfield lane from the relusplitter benchmark.
+# Keep configs/vnncomp25/relusplitter.yaml unchanged for the RSPLITTER path.
+#
+# Reference recipe:
+# - solver.bound_prop_method: crown
+# - solver.batch_size: 4
+# - bab.branching.method: sb + input_split.enable
+# - attack.pgd_order: after, pgd_restarts: 300, pgd_steps: 20
+# Source:
+# alpha-beta-CROWN (github.com/Verified-Intelligence/alpha-beta-CROWN) complete_verifier/exp_configs/vnncomp22/cifar_biasfield.yaml
+#
+# Deliberate non-goals for this pilot:
+# - attack_mode: diversed_PGD
+# - attack.input_split.*
+# - attack.input_split_check_adv.*
+# - reorder_bab
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
+  csv_name: instances.csv
+
+solver:
+  batch_size: 4
+  bound_prop_method: crown
+
+attack:
+  # ny currently treats pgd_order as PGD enablement, not scheduler parity.
+  pgd_order: after
+  pgd_restarts: 300
+  pgd_steps: 20
+
+bab:
+  branching:
+    method: sb
+    input_split:
+      enable: true
+      sb_coeff_thresh: 2.0

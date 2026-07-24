@@ -1,0 +1,48 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# challenging_certified_training_2026 VNN-COMP 2026 benchmark config
+#
+# Benchmark characteristics:
+# - CIFAR-10 / TinyImageNet CNN7 (7-layer sequential conv) L-inf robustness.
+# - Models are *certified-trained to be hard*: tight margins, so verification
+#   needs strong alpha-CROWN + branch-and-bound (IBP/CROWN alone won't close).
+# - Conv-dominated, high-dim input -> model-class-aware auto-branching selects
+#   ReLU-split (kFSB) on the GPU graph engine; input splitting is hopeless.
+# - No vnncomp25 ancestor and no year-suffix fallback (the name has no `_20NN`
+#   suffix to strip), so this explicit preset is REQUIRED for tuning.
+# - Templated on cifar100_2024 (conv robustness) with a wider alpha budget for
+#   the deliberately-hard margins.
+
+general:
+  root_path: ../../benchmarks/vnncomp2026/benchmarks/challenging_certified_training_2026/2.0
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 20
+  pgd_restart_when_stuck: true
+
+bab:
+  batch_size: 256
+  branching:
+    # No explicit method: auto-branching picks kFSB ReLU-split for this conv net.
+    candidates: 8
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.25
+    iterations: 30
+    full_conv_alpha: false
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.2
+    iterations: 12
+  clip:
+    relaxed: true
+  phase_budget:
+    # Hard margins: give BaB the bulk of the clock; cap warmup + PGD.
+    initial_bounds_fraction: 0.15
+    disjunctive_pgd_fraction: 0.10
+    post_bab_pgd_fraction: 0.10

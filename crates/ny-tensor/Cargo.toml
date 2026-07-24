@@ -1,0 +1,39 @@
+[package]
+name = "ny-tensor"
+description = "Bounded tensor types with interval arithmetic for ny"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+test-utils = []
+
+[dependencies]
+ny-core = { path = "../ny-core" }
+ndarray.workspace = true
+rayon.workspace = true
+serde.workspace = true
+half.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ny-test-utils = { path = "../ny-test-utils", default-features = false }
+approx.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+ntest.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ndarray = { workspace = true, features = ["blas"] }
+blas-src.workspace = true
+
+[[bench]]
+name = "compressed"
+harness = false

@@ -1,0 +1,115 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cifar100_2024 VNN-COMP 2025 benchmark config
+# Ported from alpha-beta-CROWN: complete_verifier/exp_configs/vnncomp25/cifar100.yaml
+#
+# Benchmark characteristics:
+# - CIFAR-100 ResNet classification (100 output classes)
+# - DAG topology (residual skip connections) uses kFSB ReLU splitting
+# - 200 instances with 100s timeout each
+# - Medium-large models (10-15MB)
+# - Reference uses merge_bn, kfsb branching, clip_interm_domain
+# - ny: graph kFSB with child evaluation (#4300)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cifar100_2024
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: middle
+  pgd_restarts: 10
+  pgd_restart_when_stuck: true
+
+# The margin-row lane remains productive on the historical closure tier. For
+# the seven exact still-open medium rows, release its fixed reserve back to the
+# alpha/beta verifier. Unknown or renamed eligible rows retain the reserve;
+# structural nonmatches keep the historical NotApplicable behavior. The
+# released route also arms the bounded sparse root CROWN pass in-process.
+margin_row:
+  adaptive_reserve: true
+
+bab:
+  batch_size: 256
+  branching:
+    # method removed: model-class-aware auto-branching selects ReLU-split (kFSB,
+    # graph engine) for this high-dim conv net (3072-element input) — input-splitting
+    # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
+    candidates: 7
+    reduceop: max
+    # #kfsb-multi: arm the wave-batched multi-objective kFSB selector. Measured
+    # Pareto on cifar100 (9/9 instances strictly better bound trajectory, 0
+    # verdict regressions, wall never extended). Kill switch: NY_MO_KFSB=0.
+    kfsb_multi: true
+  alpha_crown:
+    lr_alpha: 0.25
+    iterations: 20
+    full_conv_alpha: false
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.2
+    iterations: 10
+  # #cifar-head-crown: the official winner's pre-alpha CROWN intermediate at
+  # the structurally discovered Linear/Gemm -> ReLU head is the first measured
+  # beneficial divergence from NY. On prop1761 this one 0.5s shrink-intersect
+  # reduced total head width 327.98 -> 164.15 and unstable head neurons 44 -> 22;
+  # it improved root objective coverage from 94/99 to 98/99. This is bound
+  # evidence only, not a verdict claim. A 2s cap leaves runtime headroom.
+  root_crown_interm_dense_head: true
+  root_crown_interm_max_secs: 2
+  root_crown_interm_max_dim: 512
+  # Phase budget overrides (#2206 Packet E).
+  # Evidence: PGD + alpha-CROWN warmup consumed 176s on a 100s timeout
+  # (all budget spent before BaB). Cap warmup at 15% of total.
+  phase_budget:
+    # #attack-extend gate cannot discriminate on this benchmark: near-boundary
+    # (promising-margin) HOLD instances trigger the extension, which then consumes
+    # the entire remaining budget before warmup/BaB ever run (measured 2026-07-12:
+    # prop8945 with the extension = 6-line silent timeout; with 0.0 = 890 BaB
+    # domains and best margin +0.018 at the 100s budget). Same class of fix as
+    # disjunctive_pgd_max_secs below.
+    attack_extension_fraction: 0.0
+    initial_bounds_fraction: 0.15
+    # The graph gradient disjunctive PGD (graph_pgd.rs `try_graph_disjunctive_pgd_attack`)
+    # replaced the old RANDOM-SAMPLING disjunctive attack, which found nothing on conv
+    # ResNets and was therefore cut to 0.10. Gradient PGD is productive — it solves the
+    # `sat` instances (oracle-confirmed) in a few seconds, exactly as α,β-CROWN does — so
+    # the budget is restored to 0.40. The unsat instances time out regardless (BaB cannot
+    # close them yet), so attack budget is "free": it can only convert timeouts into sound
+    # sat solves, never a wrong verdict.
+    #
+    # #reclaim-pgd (measured 2026-07-09): cifar100 is HOLD-heavy, so on the common
+    # UNSAT instance the falsifier finds nothing and burns its whole slice as dead
+    # time before BaB. The disjunctive fast-path BaB re-bases on REMAINING time, so
+    # every second NOT spent in PGD flows straight to BaB. Rather than cut the
+    # FRACTION (which would shrink the sat-instance falsification budget and risk a
+    # missed counterexample = a lost +10), keep 0.40 and add an ABSOLUTE ceiling:
+    # disjunctive_pgd_max_secs caps PGD at 30s at ANY budget. At 100s that reclaims
+    # 10s for BaB (40s -> 30s) while leaving 30s + a 10s post-BaB pass for sat
+    # (sat is falsified in a few seconds); at a 300s budget it reclaims 90s
+    # (0.40*300 = 120s -> 30s) AND fixes the large-budget hang where the start-
+    # anchored PGD slice + the concurrent forward-linear warmer under thread::scope
+    # stalled the whole phase before BaB ran (measured: bigbet@300s went from a
+    # depth-0/no-output HANG to depth-12). NOTE: even so the cifar100 WALL is BaB
+    # convergence throughput (the prop885 straggler climbs ~+0.25/depth and is still
+    # -1.24 at depth 9 / 300s), NOT PGD budget — reclaim helps a little, but the
+    # unsat pool needs the on-device batched-across-domains BaB throughput lever.
+    disjunctive_pgd_fraction: 0.40
+    disjunctive_pgd_max_secs: 30
+    # #graph-mip-admission-refund (measured 2026-07-22): the medium ResNet's
+    # whole-net encoding is about 44M nonzeros, so Graph-MIP deterministically
+    # declines against the shipped 5M memory-safety cap. Reserving its default
+    # 25% slice before that admission check shortened BaB by 9.5s and prevented
+    # every CUDA-wide wave on prop2477. A zero reservation also declines the
+    # whole-net AUTO fallback and its root-bounds stash, preventing an early BaB
+    # return from paying a late bounds recompute before the inevitable NNZ
+    # rejection. Explicit complete-verifier MIP remains an override, and the
+    # independent per-leaf oracle remains available.
+    # Matched 100s A/B: default root end 64.2s / zero CUDA dispatches;
+    # zero-reserve root end 54.7s / 30 of 30 CUDA calls through depth 5.
+    mip_min_fraction: 0.0
+    mip_min_secs: 0
+    # Reserve 10% of total timeout for post-BaB PGD fallback (#2206).
+    post_bab_pgd_fraction: 0.10

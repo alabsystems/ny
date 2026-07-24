@@ -1,0 +1,49 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# traffic_signs_recognition_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - German traffic sign classification CNNs (quantized)
+# - 3 model sizes: 30x30 (2700 inputs), 48x48, 64x64
+# - 43 output classes, 42 constraints per property
+# - 44 instances, 480s timeout each
+# - Epsilon values 1-15 (very large perturbations)
+# - Sequential feedforward CNNs (Conv+BN+Dense, no skip connections)
+# - No alpha-beta-CROWN reference config found
+# - Large epsilon likely makes most instances SAT (PGD should find violations)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/traffic_signs_recognition_2023
+  csv_name: instances.csv
+  device: wgpu
+
+attack:
+  pgd_order: before
+  pgd_restarts: 50
+  pgd_steps: 200
+  # Binarized QConv/Sign nets: Sign's zero gradient (and the saturated tanh
+  # smoothing) kills SPSA/PGD — the 2025 winner falsified 43/45 with a
+  # surrogate-gradient attack. STE surrogate is attack-only (#surrogate-sign):
+  # probes see d/dx sign(x) = 1; every candidate is re-validated + ORT-gated.
+  surrogate_sign_gradient: true
+  # OSI-diversified restarts + GAMA guidance on the relational disjuncts
+  # (#1449); attack-only, same downstream validation.
+  attack_mode: diversed_GAMA_PGD
+
+bab:
+  batch_size: 64
+  branching:
+    # method removed: model-class-aware auto-branching selects ReLU-split (kFSB,
+    # graph engine) for this high-dim conv net (12288-element input) — input-splitting
+    # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
+    candidates: 5
+    reduceop: max
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 10

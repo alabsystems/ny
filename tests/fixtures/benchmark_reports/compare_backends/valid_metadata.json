@@ -1,0 +1,41 @@
+{
+    "schema_version": "benchmark_report_metadata_v1",
+    "report_date": "2026-03-21",
+    "issue": 4282,
+    "title": "GPU Backend Delta: cersyve + metaroom_2023",
+    "epic": 4258,
+    "summary_lines": [
+        "Compare CPU vs WGPU backend on cersyve and metaroom_2023 categories."
+    ],
+    "commands": [
+        {
+            "label": "Compare backends",
+            "shell": "python3 scripts/benchmark_vnncomp.sh --compare-backends --categories cersyve,metaroom_2023"
+        }
+    ],
+    "artifact_notes": [
+        {
+            "label": "cersyve CSV",
+            "path": "reports/benchmarks/cersyve_compare_backends.csv"
+        },
+        {
+            "label": "metaroom CSV",
+            "path": "reports/benchmarks/metaroom_2023_compare_backends.csv"
+        }
+    ],
+    "divergence_notes": [
+        "No status divergences observed between CPU and WGPU backends."
+    ],
+    "report_notes": [
+        {
+            "heading": "Observations",
+            "bullets": [
+                "WGPU shows modest speedup on both categories.",
+                "Bound widths are identical across backends."
+            ]
+        }
+    ],
+    "verdict_lines": [
+        "**PASS**: No divergences. WGPU backend is safe to use for these categories."
+    ]
+}

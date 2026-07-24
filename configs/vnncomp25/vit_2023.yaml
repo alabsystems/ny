@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# vit_2023 VNN-COMP benchmark config (200 instances, 100s each; 100x pgd_2_3_16
+# + 100x ibp_3_3_8 vision transformers, 3072-dim input, disjunctive robustness).
+#
+# Measured baseline (2026-07-04, no preset): 50% of the budget burned in the
+# disjunctive-PGD phase (~290 point-IBP forward evals at ~45ms, finds nothing),
+# alpha-CROWN reaches iter ~5/100 on CPU before the initial-bounds deadline,
+# margins -6.5..-9.7 vs threshold. Winner (alpha-beta-CROWN vnncomp23/vit.yaml
+# + custom_adhoc_tuning.py): pgd_order skip, iteration 50, lr_alpha 0.5,
+# share_alphas when >=6 MatMuls, bound_opts softmax=complex, GPU.
+#
+# Phase A (this preset): reclaim the PGD budget for alpha-CROWN. Attack kept at
+# a 5% sliver (point-IBP evals are too slow to find anything; the ORT-batched
+# attack rework would make this budget useful — see four-walls W2 design).
+# share_alphas is accepted as a no-op: ny's graph alpha state is already
+# per-node shared (no spec-row dimension).
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/vit_2023
+  csv_name: instances.csv
+  device: wgpu
+
+solver:
+  alpha-crown:
+    iterations: 50
+    lr_alpha: 0.5
+    share_alphas: true
+    # softmax: complex — MEASURED NET-NEGATIVE 2026-07-04 (four-walls W2-B):
+    # the decomposition is sound and alpha-optimizable, but at vit scale it
+    # costs ~3x per alpha iteration and the best bound never improved through
+    # iter 6 while the direct-LSE arm improved -379 -> -62. Machinery stays in
+    # tree (set `softmax: complex` to re-enable) pending follow-ups:
+    # AnalyticChain gradient capture on the decomposed graph + freezing
+    # MulBinary/Reciprocal alphas (winner's disable_optimization analog).
+
+bab:
+  phase_budget:
+    upfront_pgd_fraction: 0.0
+    disjunctive_pgd_fraction: 0.05
+    initial_bounds_fraction: 0.60

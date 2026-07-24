@@ -1,0 +1,43 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# dist_shift_2023 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - Distribution-shift robustness benchmark over a small MNIST concat MLP
+# - 72 instances, already measured at 71/72 (99%) on current ny
+# - Reference config uses input split plus clip-input-domain; this preset keeps
+#   the subset that the current ny preset loader supports so the benchmark
+#   runner can auto-discover a category-specific configuration.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/dist_shift_2023
+  csv_name: instances.csv
+
+attack:
+  pgd_order: after
+  # Reference: alpha-beta-CROWN dist-shift.yaml uses diversed_PGD (#1449).
+  # OSI initialization pushes restart seeds toward diverse output regions.
+  attack_mode: diversed_PGD
+  pgd_steps: 20
+  pgd_restarts: 5000
+
+bab:
+  batch_size: 192
+  min_batch_size_ratio: 1.0
+  # branching method removed: model-class-aware auto-branching now owns this.
+  # dist_shift is the "moderate-dim small/shallow net" class — 792-element input
+  # over a small conv/FC MNIST autoencoder (few params, few ReLU nodes) — which
+  # the heuristic routes to INPUT splitting (AutoBranchingReason::SmallShallowNet),
+  # reproducing what `method: input` did. See branching.rs::auto_select_branching.
+  alpha_crown:
+    lr_alpha: 0.25
+    iterations: 5
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15
+  clip:
+    relaxed: true
+    relaxed_iterations: 20

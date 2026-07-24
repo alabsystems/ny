@@ -1,0 +1,47 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cersyve proof-only sidecar for #4210 live batched-alpha canary runs.
+# Mirrors the production preset but keeps relaxed clipping by omitting
+# `clip_type: complete`, so deferred children stay eligible for the batched
+# rebound lane.
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/cersyve
+  csv_name: instances.csv
+
+solver:
+  batch_size: 500000
+  min_batch_size_ratio: 0.1
+
+attack:
+  pgd_order: before
+  pgd_restarts: 100
+
+bab:
+  batch_size: 500000
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      enable: true
+      sb_coeff_thresh: 1.0e-2
+      sb_sum: true
+      touch_zero_score: 0.1
+      reorder_bab: true
+      adv_check: -1
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+  phase_budget:
+    initial_bounds_fraction: 0.15
+    post_bab_pgd_fraction: 0.10
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

@@ -1,0 +1,69 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# linearizenn_2024 VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - LinearizeNN: linearization-based NN verification
+# - 60 instances
+# - DAG concat/slice topology requires graph input splitting on ny (#3218)
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/linearizenn_2024
+  csv_name: instances.csv
+
+solver:
+  # Bounded per-iteration batch for the reordered input-split BaB below. The
+  # reorder loop pops up to `batch_size` domains per iteration and bounds them
+  # with one batched CROWN backward; 512 keeps the transient workset small while
+  # still saturating the CPU cores. (alpha-crown is NOT usable here: the
+  # disjunctive multi-clause batched bounding path produces garbage bounds under
+  # alpha — gap frozen at ~-1345 — so plain `crown` is the correct, tight source.)
+  batch_size: 512
+  bound_prop_method: crown
+
+attack:
+  pgd_order: after
+  # linearizenn is 59/60 unsat; the single sat instance (prop_10_10) is caught
+  # by the first PGD restart in <0.02s. The upfront graph-PGD attack is FIXED
+  # work (independent of the wall-clock budget) and at 10000 restarts it burned
+  # ~30s on the small nets and ~91s on AllInOne_120_120 before BaB even started
+  # — pure waste on every unsat instance. Dropping to 100 restarts frees that
+  # budget for the input-split BaB (the actual bottleneck here) while still
+  # catching the near-corner sat. SOUND: attack is ORT-confirmed counterexample
+  # search only; fewer restarts can never emit a wrong verdict, at worst it
+  # would downgrade a genuine sat to unknown — and the lone sat is found
+  # instantly. (#linearizenn-attack-budget)
+  pgd_restarts: 100
+
+bab:
+  # #linearizenn-domain-cap: the engine default max_domains=100_000 truncated
+  # AllInOne_120_120 prop_120_120_0 at ~554s of its 855s BaB budget (measured:
+  # Unknown("Domain limit 100000") with 300s left; the sibling prop_120_120
+  # converged to unsat just UNDER the cap at 512s). The reorder_bab queue here
+  # DRAINS to a proof (peaks then shrinks), so more domains = more proof, never
+  # a wrong verdict (the cap is a search-effort limit, not verdict math; same
+  # precedent as cersyve/lsnc 10M).
+  max_domains: 10000000
+  branching:
+    method: input
+    candidates: 10
+    reduceop: max
+    input_split:
+      enable: true
+      # THE lever for AllInOne_120_120 (#linearizenn-bab-reorder). Default-OFF
+      # input-split BaB pops ONE domain per iteration and screens split children
+      # against the PARENT's stale linear bounds — the best-domain gap plateaus at
+      # ~-1.17 and never verifies (bound floor, not budget). reorder_bab bounds
+      # every child with a FRESH batched CROWN backward BEFORE splitting, so the
+      # per-domain gap actually tightens (→ 0), the queue peaks (~3k domains) and
+      # then DRAINS to a proof. Reference: alpha-beta-CROWN
+      # bab.branching.input_split.reorder_bab (its default for input-split nets).
+      # SOUND: CROWN is a sound over-approximation; a tighter sound bound only ever
+      # verifies fewer/more domains, never emits a wrong verdict.
+      reorder_bab: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 15

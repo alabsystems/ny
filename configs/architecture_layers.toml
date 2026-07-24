@@ -1,0 +1,63 @@
+# Architecture Layer Policy
+#
+# Defines the target crate topology for ny (see docs/architecture-review-2026-02-07.md).
+# Validated by scripts/check_architecture_layers.py.
+#
+# Part of #2126, Part of #1696
+#
+# Layer rules:
+#   - Higher layers may depend on lower layers (L3 -> L2 -> L1 -> L0).
+#   - Same-layer dependencies are allowed (peer deps).
+#   - Lower layers must NOT depend on higher layers (enforced).
+#   - Dev-only dependencies follow the same layer rules by default.
+#   - Exceptions must be listed explicitly with an owner and tracking issue.
+
+[layers]
+# L0: Core types, traits, errors
+L0 = ["ny-core"]
+
+# L1: Tensors, model loading/parsing
+L1 = ["ny-tensor", "ny-load"]
+
+# L2: Algorithms — bound propagation, network construction, conversion
+L2 = ["ny-propagate", "ny-build", "ny-onnx"]
+
+# L3: Interfaces and backends
+L3 = ["ny-cli", "ny-python", "ny-gpu", ""]
+
+# Sidecar: not part of the main dependency chain
+sidecar = ["ny-api", "ny-test-utils"]
+
+# Sidecar crates may depend on any layer but are not checked for
+# downward violations. They are excluded from default-members.
+
+# --- Temporary exceptions ---
+#
+# Each exception permits one otherwise-forbidden dependency edge.
+# Fields:
+#   from   = crate with the dependency
+#   to     = crate being depended on
+#   kind   = "normal" or "dev"
+#   owner  = GitHub issue tracking removal
+#   reason = why the exception exists
+
+[[exceptions]]
+from = "ny-onnx"
+to = "ny-gpu"
+kind = "normal"
+owner = "#2810"
+reason = "ny-onnx profile/bench code uses GPU acceleration; tracked for removal in #2810"
+
+[[exceptions]]
+from = "ny-propagate"
+to = "ny-gpu"
+kind = "dev"
+owner = "#2810"
+reason = "examples/profile.rs and benches need GPU; move to ny-gpu per architecture review"
+
+[[exceptions]]
+from = "ny-load"
+to = "ny-build"
+kind = "normal"
+owner = "#2126"
+reason = "ny-load delegates network construction to ny-build (L2); needs inversion per architecture review"

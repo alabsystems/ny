@@ -1,0 +1,58 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ny"
+version = "0.1.0"
+description = "Python bindings for ny neural network verification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+keywords = ["neural-network", "verification", "testing", "onnx", "debugging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "onnx>=1.14",
+    "safetensors>=0.3",
+    "gguf>=0.6",
+]
+pytest = [
+    "pytest>=7.0",
+]
+
+[project.entry-points."pytest11"]
+ny = "ny_pytest.plugin"
+
+[tool.maturin]
+# Enable extension-module via our cargo feature, not pyo3's directly.
+# This allows cargo test to work without the feature enabled.
+features = ["extension-module", "ort", "wgpu", "pytorch", "gguf", "coreml"]
+module-name = "ny"
+include = ["ny.pyi", "py.typed", "ny_pytest/**/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "ny_pytest/tests"]
+# Default ny verification settings (can be overridden via CLI or markers)
+ny_timeout = 60
+ny_epsilon = 0.01
+ny_method = "crown"
+ny_tolerance = 1e-5

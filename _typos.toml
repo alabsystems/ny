@@ -1,0 +1,11 @@
+[default]
+extend-ignore-re = ["\\bBaB\\b", "4b4ede7a7d21eb58", "2daa40ea0"]
+
+[default.extend-words]
+ba = "ba"
+diversed = "diversed"
+flate = "flate"
+interm = "interm"
+Nd = "Nd"
+ND = "ND"
+Yot = "Yot"

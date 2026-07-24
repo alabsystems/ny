@@ -1,0 +1,98 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# relusplitter VNN-COMP 2025 benchmark config
+#
+# Benchmark characteristics:
+# - ReLU splitting benchmark: MNIST FC (256x4, 256x6), CIFAR CNNs (oval21, biasfield)
+# - 220 instances: MNIST 80 + CIFAR oval21 60 + CIFAR biasfield 80
+#   (each original model paired with RSPLITTER variant at 3x timeout)
+# - Disjunctive output properties (multi-class classification)
+# - ny measured: 82/220 (37%) on current HEAD (2026-03-13 re-confirmed)
+#   MNIST 256x4 34/40, 256x6 10/40; CIFAR base_kw 13/20, deep_kw 8/20,
+#   wide_kw 9/20, biasfield 8/80 (all counterexamples)
+# - alpha-beta-CROWN reference: uses auto verifier (MIP+BaB), CPLEX cuts,
+#   diversified_PGD attack, clip_input_domain
+# - Gap vs reference:
+#   * complete_verifier: auto (MIP fallback when BaB stalls) — not configured
+#   * attack_mode: diversed_PGD — implemented (#1449)
+#   * cplex_cuts: True, bab_cut: True — ny uses own cutting planes, not CPLEX
+#   * reorder_bab: True — not implemented in ny
+#   * batch_size: 4 + auto_enlarge_batch_size: True — ny uses fixed 64
+#   * start_save_best: -1 — not implemented
+#   * sb_coeff_thresh: 2.0 (reference) vs not set (ny default)
+# - Status: ENTRY READY (82/220). All algo blockers CLOSED (#523, #3397, #1074).
+#   Re-probe 2026-03-13 MNIST 256x6: kFSB ~6 domains/sec, input-split ~1 dom/sec.
+#   No improvement from algo closures (kFSB on CPU, not GPU/input-split path).
+#   Feature gap: CPLEX cuts, GPU threading (#3597). Diversified PGD: #1449 CLOSED.
+# - Biasfield timeout root cause (2026-03-14 analysis, Part of #3218):
+#   Conv2d CROWN backward takes ~30s PER NODE on CPU for biasfield CNN models.
+#   Deadline check in spec_propagation.rs:291 is per-node (between nodes), NOT
+#   within a node — so a single Conv2d backward dominates the entire timeout.
+#   Measured: 42.6s actual with 15s timeout (deadline overshoot 27.6s).
+#   Config tuning (pgd_restarts, alpha_iterations) saves time in OTHER phases
+#   but cannot bypass the Conv2d CROWN backward bottleneck.
+#   RESOLVED: GPU CROWN backward with fused conv_transpose_2d now available (#3813).
+#   Measured 19.8x speedup on soundnessbench-shaped 6-Conv2d workload (graph
+#   CROWN-IBP collection: CPU 257.56s vs GPU 12.97s, March 15 2026).
+#   Config changes below still help MNIST FC (verified 3x faster: 2.8s vs 8.14s)
+#   and may help CIFAR oval21 (smaller Conv2d models with faster backward).
+
+general:
+  root_path: ../../benchmarks/vnncomp2025/benchmarks/relusplitter
+  csv_name: instances.csv
+  # GPU CROWN backward for Conv2d-heavy biasfield models. Fused conv_transpose_2d
+  # avoids the CPU 30s+ per-node bottleneck that caused #3813 timeouts.
+  device: wgpu
+  # Reference-compatible: patches normally, matrix when cuts are enabled.
+  # With cuts.enabled=true below, this routes Conv2d CROWN backward through the
+  # dense matrix path instead of patches, eliminating per-node 30s+ bottlenecks.
+  # Reference: abcrown.py:228-231 (matrix if bab_args['cut']['enabled']).
+  conv_mode: auto
+
+attack:
+  pgd_order: middle
+  # Reference: alpha-beta-CROWN relusplitter.yaml uses diversed_PGD (#1449).
+  # OSI initialization pushes restart seeds toward diverse output regions.
+  attack_mode: diversed_PGD
+  # Reduced from 200: CNN biasfield forward passes are expensive (~1-5ms each);
+  # 200 restarts x 20 steps consumes the entire 50% PGD deadline on CNN models.
+  # 50 restarts is still sufficient for MNIST FC counterexamples (<0.5s total).
+  pgd_restarts: 50
+
+bab:
+  # Reduced from 64: smaller batches make per-BaB-iteration faster for CNN models
+  # (CROWN backward cost scales with batch size). Reference uses 4 + auto_enlarge.
+  batch_size: 4
+  # #3813: stop fixed-slope CROWN after the classifier tail and concretize the
+  # remaining Conv2d trunk with sound forward bounds. This mirrors the
+  # alpha-beta-CROWN fixed-intermediate-bound strategy and keeps RSPLITTER root
+  # bounds from spending the full timeout in Conv2d backward.
+  crown_backward_layers: 6
+  branching:
+    method: kfsb
+    candidates: 10
+    reduceop: max
+  cuts:
+    enabled: true
+    near_miss: true
+    near_miss_margin: 0.01
+    proactive: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+    interm_domain: true
+  alpha_crown:
+    lr_alpha: 0.2
+    # Reduced from 100: the dominant bottleneck for biasfield CNN 0-domain timeouts.
+    # 2 passes x 100 iterations of CROWN backward on Conv2d graph models exhausts
+    # 30s+. Alpha-CROWN converges in <10 iterations for FC models (MNIST unaffected).
+    # For CNN models, 20 iterations provides useful bound tightening while leaving
+    # budget for BaB. Reference does not set explicit iterations (uses default ~100)
+    # but compensates with matrix Conv mode (fast backward) and auto_enlarge.
+    iterations: 20
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.01
+    iterations: 15

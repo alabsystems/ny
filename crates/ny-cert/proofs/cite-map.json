@@ -1,0 +1,33 @@
+{
+  "_doc": "Cite-map for the L1 cite-discharge (Trust = Clean fusion). Maps each cited NY function to the Clean/Lean theorem its soundness/completeness postcondition is grounded in. Each theorem is verified declared + sorry-free in the exact revision-pinned Clean Lake dependency by ny_cert::cite_check. The planned trust_verify cite-discharge consumes this map: where a function's #[ensures] postcondition cannot be discharged by ay, it is recorded Certified-modulo-cited-theorem (the theorem in the assumption closure), fail-closed if the theorem does not resolve. The CHECKERS (selfcheck / branch) gate SOUNDNESS; the cert PRODUCERS (crown / crown_deep / sbar) carry the matching COMPLETENESS citations. Kept in sync with every discovered #[trust::cite] annotation below src/ by cite_check::tests::cite_map_matches_source.",
+  "schema_version": 1,
+  "corpus": {
+    "source": "lake-git-dependency",
+    "package": "crownproof",
+    "git": "https://github.com/alabsystems/clean.git",
+    "rev": "a119ed0cfdafcb3eca4904253fdc51283e2ff0f8",
+    "subDir": "crown-proofs/lean",
+    "packagesDir": ".lake/packages",
+    "moduleRoot": "Crownproof",
+    "mathlib": {
+      "package": "mathlib",
+      "git": "https://github.com/leanprover-community/mathlib4.git",
+      "rev": "c5ea00351c28e24afc9f0f84379aa41082b1188f"
+    }
+  },
+  "citations": [
+    { "function": "selfcheck::check_farkas", "theorem": "farkas_premise_combination", "obligation": "postcondition", "role": "checker-soundness" },
+    { "function": "selfcheck::check_entailment", "theorem": "farkas_premise_combination", "obligation": "postcondition", "role": "checker-soundness" },
+    { "function": "selfcheck::check_chain", "theorem": "farkas_premise_combination", "obligation": "postcondition", "role": "checker-soundness" },
+    { "function": "branch::check_branch_tree", "theorem": "branch_split_min", "obligation": "postcondition", "role": "checker-soundness" },
+    { "function": "crown::Relu1Problem::certify", "theorem": "crown_bridge", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify", "theorem": "crown_bridge_deepK", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify_with_interm", "theorem": "crown_bridge_deepK", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify_with_interm_cuts", "theorem": "crown_bridge_deepK", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify_difference_linear", "theorem": "farkas_premise_combination", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify_difference_quadratic", "theorem": "farkas_premise_combination", "obligation": "postcondition", "role": "producer-completeness" },
+    { "function": "crown_deep::DeepReluProblem::certify_difference_quadratic", "theorem": "pow2_tangent", "obligation": "postcondition", "role": "producer-premise-validity" },
+    { "function": "crown_deep::DeepReluProblem::certify_difference_quadratic", "theorem": "pow2_secant", "obligation": "postcondition", "role": "producer-premise-validity" },
+    { "function": "sbar::SimplexSupportLp::certify_upper", "theorem": "sbar_support_sound", "obligation": "postcondition", "role": "producer-completeness" }
+  ]
+}

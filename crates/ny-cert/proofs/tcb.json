@@ -1,0 +1,30 @@
+{
+  "_doc": "TCB manifest for the proof-carrying pipeline (Trust = Clean fusion): the named, explicit trust base every emitted certificate rests on. Batteries-included — the cert path attests these rows by DEFAULT (no opt-in flag). Each row records the assumption, its current status, its grounding, the residual TCB it still implies, and the discharge path that would retire it. Integrates the R_float ⊑ R_real adequacy binding (P1.3) as a machine-tracked row rather than prose. Drift-guarded against SPEC.md by ny_cert::tcb_check.",
+  "schema_version": 1,
+  "rows": [
+    {
+      "id": "float_adequacy",
+      "claim": "R_float ⊑ R_real — the f32 producer's bound is sound w.r.t. exact reals",
+      "status": "closed-by-construction-for-emitted-certs",
+      "grounding": "f32_to_rat (certify_onnx.rs:225) lifts every f32 losslessly to n/2^k (0 round-trip failures in 100k); all CROWN/relaxation math then runs in exact Rat → R_float = R_real exactly for emitted certs. No float in the cert path.",
+      "residual_tcb": "the fast preact_bounds_crown_snapped f64 path (crown_deep.rs:551) — demoted to cut-DISCOVERY-only (crown_deep.rs:790-799), falls back to exact-rational for the verdict; plus the non-cert ny-propagate verifier. CORRECTION (2026-06-29): the non-cert verifier's float soundness is NOT captured by directed outward rounding (dn/up) ALONE — that model assumes correctly-outward-rounded ops and is structurally blind to TRANSCENDENTAL underflow. A reachable FALSE PROOF was found+fixed in ny-propagate softmax IBP: a shared row-max shift made exp(score-M) underflow to exactly 0.0 (correct IEEE-754) and +SOFTMAX_EPSILON swamped the survivors, so a reachable key's p_hi collapsed to ~0 and the bound EXCLUDED a reachable true softmax of 1.0. Fixed via a per-ratio shift (dominant term = exp(0)=1, no underflow, no epsilon).",
+      "discharge_path": "FloatAdequacy.lean per-op lemmas (interval_outward_contains, affine_lower/upper_adequate, box_adequate, relu_chord_upper_adequate, float_bound_implies_real) de-TCB the directed-rounding (affine/box/ReLU) residual. For TRANSCENDENTAL ops the rounding model is insufficient: SoftmaxFloatRange.lean (added 2026-06-29) models finite-precision exp as an UNDER-ESTIMATING operator FExp (named float TCB: nonneg, le_exp : f x ≤ exp x, at_zero : f 0 = 1 — hypotheses, not axioms) and PROVES softmax_phi_upper_sound (the per-ratio-shift fix is a sound over-approximation, general n) while softmax_phi_shared_unsound CONSTRUCTIVELY REFUTES the old shared-shift form (flush-to-zero FExp + a >745-gap witness → computed 0 < true 1). VALIDATED 2026-06-29: lake build NyProof.SoftmaxFloatRange clean (1904 jobs); #print axioms (both theorems) = [propext, Classical.choice, Quot.sound] (no sorry; the FExp facts are structure fields). NyProof.FloatAdequacy still: lake clean vs Mathlib v4.30.0, integrated on main ca74984. NOT needed for emitted-cert soundness (exact path); these de-TCB the residual fast/non-cert float paths."
+    },
+    {
+      "id": "clean_kernel",
+      "claim": "the cited Clean theorems are valid",
+      "status": "kernel-checked",
+      "grounding": "farkas_premise_combination + crown_bridge / crown_bridge_deepK / sbar_support_sound / branch_split_min / pow2_tangent / pow2_secant are Lean-proven sorry-free in the exact revision-pinned Clean Lake dependency under NY's exact Mathlib v4.30.0 root override and re-typechecked by Clean's 3-axiom kernel (KERNEL_IMPORT.md); verified declared+sorry-free per-cert by cite_check against cite-map.json.",
+      "residual_tcb": "Clean's 3-axiom kernel + the Lean type-checker (the irreducible trust root).",
+      "discharge_path": "irreducible — the kernel IS the trust root."
+    },
+    {
+      "id": "ay_discharge",
+      "claim": "ay's handling of the captured L1 postcondition is sound",
+      "status": "modulo-cite",
+      "grounding": "where ay cannot discharge the L1 postcondition outright (modular bignum-Rat reasoning through combine()), it is grounded in the cited Clean theorem → CertifiedModuloCite, sound by composition. Upgrades to CertifiedToAxioms when ay discharges it.",
+      "residual_tcb": "ay (the verifying-compiler engine) for the checker's L0 machine-verification.",
+      "discharge_path": "teach ay the Rat sign theory + modular reasoning through combine() (program item #2) → CertifiedToAxioms, removing the cited assumption."
+    }
+  ]
+}

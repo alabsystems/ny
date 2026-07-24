@@ -1,0 +1,39 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# YOLO VNN-COMP 2024 benchmark config (object detection)
+# Ported from alpha-beta-CROWN: complete_verifier/exp_configs/vnncomp24/yolo-xiangruzh.yaml
+#
+# Benchmark characteristics:
+# - Very large memory footprint (shared alpha helps)
+# - Loss reduction uses max to focus on "easiest" domain
+# - Skip PGD attack (too expensive for large networks)
+# - INVPROP helps refine intermediate layers
+
+general:
+  root_path: ../../vnncomp2024_benchmarks/benchmarks/yolo_2023
+  csv_name: instances.csv
+  loss_reduction_func: max  # Focus on easiest domain to save memory
+
+attack:
+  pgd_order: skip  # Skip - too expensive
+
+bab:
+  batch_size: 128
+  pruning_in_iteration: true
+  alpha_crown:
+    share_alphas: true
+    lr_alpha: 0.3
+    lr_decay: 0.98
+    iterations: 50
+  beta_crown:
+    lr_alpha: 0.05
+    lr_beta: 0.1
+    lr_decay: 0.98
+    iterations: 10
+  invprop:
+    # Refine intermediate layer before last ReLU
+    # Node names depend on PyTorch version
+    apply_output_constraints_to:
+      - "/input-48"  # PyTorch 2.3.1 naming

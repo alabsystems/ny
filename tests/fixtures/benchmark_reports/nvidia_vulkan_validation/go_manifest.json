@@ -1,0 +1,14 @@
+{
+    "schema": "nvidia_vulkan_validation_manifest_v1",
+    "verdict": "pending",
+    "blocker": null,
+    "host_info_path": "host_info.txt",
+    "measure_log_path": "measure.log",
+    "measure_csv_path": "measure.csv",
+    "vulkan_confirmed": true,
+    "adapter_line": "wgpu adapter: NVIDIA GeForce RTX 3090 (backend: Vulkan, type: DiscreteGpu)",
+    "compare_backends_cersyve_csv": "cersyve_compare.csv",
+    "compare_backends_metaroom_csv": "metaroom_compare.csv",
+    "reference_blocker": null,
+    "reference_cersyve_real_seconds": 2.50
+}
